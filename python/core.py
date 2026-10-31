@@ -33,20 +33,26 @@ class ReadOnlySessionClient(GeminiClient):
 
 async def connect(account_id=None):
  aid,cookies,proxy=credentials(account_id)
- from profiles import registry
- if str(aid) in registry():
+ async def initialize(values):
+  client=ReadOnlySessionClient(values['__Secure-1PSID'],values.get('__Secure-1PSIDTS'),proxy=proxy)
+  for k,v in values.items():client.cookies.set(k,v,domain='.google.com',secure=True)
+  try:
+   await client.init(timeout=300,auto_refresh=False,verbose=False,watchdog_timeout=300)
+   if client.account_status.name == 'UNAUTHENTICATED':
+    raise ValueError('Gemini website session is not authenticated')
+   if not client.list_models():raise ValueError('Authenticated models unavailable')
+   return client
+  except BaseException:
+   await client.close();raise
+ # Preserve the working generation session. Browser cookies are only a recovery path.
+ try:return aid,await initialize(cookies)
+ except ValueError as error:
+  if str(error)!='Gemini website session is not authenticated':raise
+  from profiles import registry
+  if str(aid) not in registry():raise
   from browser_download import session_cookies
-  cookies=await asyncio.wait_for(session_cookies(aid,proxy),timeout=90)
- client=ReadOnlySessionClient(cookies['__Secure-1PSID'],cookies.get('__Secure-1PSIDTS'),proxy=proxy)
- for k,v in cookies.items():client.cookies.set(k,v,domain='.google.com',secure=True)
- try:
-  await client.init(timeout=300,auto_refresh=False,verbose=False,watchdog_timeout=300)
-  if client.account_status.name == 'UNAUTHENTICATED':
-   raise ValueError('Gemini website session is not authenticated. Re-login in Gemini-web-all; existing account records are preserved. Flash Lite in this state is not proof of account entitlement.')
-  if not client.list_models():raise ValueError('Authenticated models unavailable')
-  return aid,client
- except BaseException:
-  await client.close();raise
+  values=await asyncio.wait_for(session_cookies(aid,proxy),timeout=90)
+  return aid,await initialize(values)
 
 def record(job):
  tmp=STATE/(job['id']+'.tmp');tmp.write_text(json.dumps(job,ensure_ascii=False,indent=2));tmp.replace(STATE/(job['id']+'.json'))
