@@ -1,6 +1,6 @@
 {
   "name": "gemini-web-all",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Gemini-web-all: Gemini website chat, original image generation and automatic login capture",
   "type": "module",
   "main": "./index.mjs",

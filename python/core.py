@@ -1,5 +1,5 @@
-"""Local Gemini website image MCP. No browser, no API key, no cookie export."""
-import asyncio, fcntl, hashlib, json, os, sqlite3, uuid
+"""Local Gemini website images with private per-account browser sessions."""
+import asyncio, fcntl, hashlib, json, os, sqlite3, uuid, time
 from pathlib import Path
 from http.cookies import SimpleCookie
 from urllib.parse import urlparse
@@ -14,7 +14,7 @@ ROOT=Path(__file__).resolve().parent
 STATE=Path(os.environ['GEMINI_WEB_ALL_RUNTIME'])/'state'; STATE.mkdir(parents=True,exist_ok=True,mode=0o700)
 os.umask(0o077)
 DB=Path(os.environ.get('GEMINI_WEB_DATA_DIR',str(Path.home()/'.local/share/magpie-gemini-web')))/'gemini.db'
-mcp=MCPServer('gemini-web-images',instructions='Generate images using Gemini WEBSITE, not AI Studio. Full-size RPC download is mandatory. Use only for user-authorized image tasks; one job at a time. Never resubmit a pending job. No browser is launched. Output paths are local.',log_level='ERROR')
+mcp=MCPServer('gemini-web-images',instructions='Generate images using Gemini WEBSITE, not AI Studio. Full-size RPC download is mandatory. Use only for user-authorized image tasks; one job at a time. Never resubmit a pending job. Headless browser sessions are used for authentication and original download. Output paths are local.',log_level='ERROR')
 tasks={}
 
 def credentials(account_id):
@@ -33,6 +33,10 @@ class ReadOnlySessionClient(GeminiClient):
 
 async def connect(account_id=None):
  aid,cookies,proxy=credentials(account_id)
+ from profiles import registry
+ if str(aid) in registry():
+  from browser_download import session_cookies
+  cookies=await asyncio.wait_for(session_cookies(aid,proxy),timeout=90)
  client=ReadOnlySessionClient(cookies['__Secure-1PSID'],cookies.get('__Secure-1PSIDTS'),proxy=proxy)
  for k,v in cookies.items():client.cookies.set(k,v,domain='.google.com',secure=True)
  try:
@@ -53,18 +57,25 @@ def safe_url(url):
   raise ValueError('Unexpected image download host')
  return url
 
-async def full_download(client,img,directory):
+async def full_download(client,img,directory,account_id=None):
  if not all([img.cid,img.rid,img.rcid,img.image_id]):raise ValueError('Missing full-size image metadata')
  url=await client._get_full_size_image(cid=img.cid,rid=img.rid,rcid=img.rcid,image_id=img.image_id)
  if not url:raise ValueError('Full-size RPC unavailable; preview was NOT substituted')
  url=safe_url(url)+'=d-I?alr=yes'
- for _ in range(4):
-  response=await client.client.get(safe_url(url),headers=Headers.REFERER.value)
-  response.raise_for_status()
-  if response.headers.get('content-type','').startswith('image/'):
-   data=response.content;break
-  url=response.text.strip()
- else:raise ValueError('Full-size download did not return image bytes')
+ try:
+  for _ in range(4):
+   response=await client.client.get(safe_url(url),headers=Headers.REFERER.value)
+   response.raise_for_status()
+   if response.headers.get('content-type','').startswith('image/'):
+    data=response.content;break
+   url=response.text.strip()
+  else:raise ValueError('Full-size download did not return image bytes')
+  method='website-full-size-rpc'
+ except Exception:
+  if account_id is None:raise
+  from browser_download import download
+  data=await asyncio.wait_for(download(account_id,safe_url(await client._get_full_size_image(cid=img.cid,rid=img.rid,rcid=img.rcid,image_id=img.image_id))+'=d-I?alr=yes',client.proxy),timeout=180)
+  method='website-full-size-rpc-persistent-browser'
  import io
  with PILImage.open(io.BytesIO(data)) as pic:
   pic.verify()
@@ -73,7 +84,7 @@ async def full_download(client,img,directory):
  if not ext:raise ValueError('Unsupported returned image format')
  file=directory/('original'+ext)
  with file.open('xb') as stream:stream.write(data)
- return {'path':str(file),'width':width,'height':height,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'download':'website-full-size-rpc','upscaled_locally':False}
+ return {'path':str(file),'width':width,'height':height,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'download':method,'upscaled_locally':False}
 
 async def run_job(job,prompt,refs,output,account_id,lock):
  client=None
@@ -82,12 +93,19 @@ async def run_job(job,prompt,refs,output,account_id,lock):
   available={str(m):m for m in client.list_models()}
   if job['model'] not in available:raise ValueError('Requested website model not available')
   job.update(status='generating',account_id=aid);record(job)
+  started=time.monotonic()
   response=await asyncio.wait_for(client.generate_content(prompt='Generate ONE image now. '+prompt,files=refs or None,model=available[job['model']]),timeout=600)
   images=[img for img in response.images if isinstance(img,GeneratedImage)]
   if not images:raise ValueError('Website returned no generated image')
+  job['generation_seconds']=round(time.monotonic()-started,2)
+  recovery={'account_id':aid,**{k:getattr(images[0],k) for k in ['cid','rid','rcid','image_id','url']}}
+  recovery_dir=STATE/'recovery';recovery_dir.mkdir(exist_ok=True,mode=0o700)
+  (recovery_dir/(job['id']+'.json')).write_text(json.dumps(recovery))
   job['status']='downloading';record(job)
   directory=Path(output)/job['id'];directory.mkdir(parents=True,exist_ok=False)
-  job['image']=await full_download(client,images[0],directory)
+  started=time.monotonic()
+  job['image']=await full_download(client,images[0],directory,aid)
+  job['download_seconds']=round(time.monotonic()-started,2)
   job['status']='completed';record(job)
  except BaseException as e:
   job.update(failed_stage=job.get('status'),http_status=getattr(getattr(e,'response',None),'status_code',None),status='failed',error_type=type(e).__name__,error=str(e) if isinstance(e,ValueError) else 'Website request failed; details suppressed to protect session data. No automatic resubmission.');record(job)
@@ -101,7 +119,7 @@ async def status(check_connection:bool=False)->dict:
  try:
   with sqlite3.connect(f'file:{DB}?mode=ro',uri=True) as conn:
    accounts=[{'id':r[0],'enabled':r[1]=='enabled'} for r in conn.execute('select id,status from accounts')]
-  result={'transport':'background-http','browser_required':False,'accounts':accounts,'full_size_required':True}
+  result={'transport':'background-http','browser_required':True,'accounts':accounts,'full_size_required':True}
   if check_connection:
    _,client=await connect()
    try:result['models']=[str(m) for m in client.list_models()]
@@ -111,7 +129,7 @@ async def status(check_connection:bool=False)->dict:
 
 @mcp.tool()
 async def generate_image(prompt:str,output_dir:str,reference_images:list[str]|None=None,model:str='gemini-pro',account_id:int|None=None)->dict:
- """Start ONE Gemini website image job. References must be local absolute image paths. output_dir must be absolute. model is a website alias from status, not an API image model. Uses existing Magpie Gemini Web accounts, no browser. Returns job ID; poll generation_result. Native resolution is determined by the website; no fake size/quality switches."""
+ """Start ONE Gemini website image job. References must be local absolute image paths. output_dir must be absolute. model is a website alias from status, not an API image model. Uses existing Magpie Gemini Web accounts with isolated headless browser sessions. Returns job ID; poll generation_result. Native resolution is determined by the website; no fake size/quality switches."""
  if not prompt.strip() or len(prompt)>20000:raise ValueError('Prompt must be 1–20000 characters')
  output=Path(output_dir).expanduser()
  if not output.is_absolute():raise ValueError('output_dir must be absolute')
@@ -123,11 +141,14 @@ async def generate_image(prompt:str,output_dir:str,reference_images:list[str]|No
   if p.stat().st_size>30*1024*1024:raise ValueError('Reference exceeds 30 MiB')
   with PILImage.open(p) as im:im.verify()
   refs.append(str(p.resolve()))
- lock=(STATE/'generation.lock').open('a')
+ if account_id is None:raise ValueError('Select an explicit image account')
+ from profiles import lookup
+ lookup(account_id)  # Fail before spending image quota if browser login is missing.
+ lock=(STATE/f'generation-{int(account_id)}.lock').open('a')
  try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
  except BlockingIOError:
   lock.close();return {'status':'busy','message':'Another generation is active. Poll its job; do not resubmit.'}
- job={'id':uuid.uuid4().hex,'status':'queued','model':model,'reference_count':len(refs)};record(job)
+ job={'id':uuid.uuid4().hex,'status':'queued','model':model,'reference_count':len(refs),'account_id':account_id};record(job)
  tasks[job['id']]=asyncio.create_task(run_job(job,prompt,refs,str(output),account_id,lock))
  return dict(job)
 
@@ -139,7 +160,7 @@ async def generation_result(id:str)->dict:
  if not path.exists():raise ValueError('Unknown job')
  job=json.loads(path.read_text())
  if job['status'] in ['queued','generating','downloading'] and id not in tasks:
-  with (STATE/'generation.lock').open('a') as lock:
+  with (STATE/(f"generation-{int(job['account_id'])}.lock" if job.get("account_id") is not None else "generation.lock")).open('a') as lock:
    try:
     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     job['status']='interrupted';job['error']='Worker ended. Do not blindly resubmit; inspect Gemini history first.'

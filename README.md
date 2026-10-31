@@ -5,10 +5,10 @@
 ## 能力
 
 - Magpie Settings → Images → Image generation 中选择 `gemini-web/gemini-web-pro-image`（Gemini 官网生图 · Pro）。
-- 使用Magpie原有generate_image，支持参考图；生成后台运行，不开浏览器。
+- 使用Magpie原有generate_image，支持参考图；生成后台运行；会话续用和原图下载按需启动无界面浏览器，完成后关闭。
 - 原图必须经官网完整尺寸RPC下载，不回退预览图，不本地放大。已验证2752×1536；不承诺4K，quality不映射为官网质量档位。
 - 保留 `gemini-web` / `ai-studio` 供应商ID与原数据目录，已有登录无需重新复制Cookie。
-- 新增“自动获取 Cookie（独立登录窗口）”：用户完成Google登录后自动收取该独立窗口的登录态，关闭并清理临时浏览器目录。不会读取日常浏览器，也不会自动填写密码或绕过验证码。Google可能拒绝自动化浏览器；原Cookie导入入口保留作为回退。
+- 新增“自动登录（独立持久化账号）”：用户完成Google登录后保留独立浏览器目录，并按账号身份绑定；日常无窗口运行。不会读取日常浏览器，也不会自动填写密码或绕过验证码。Google可能拒绝自动化浏览器；原Cookie导入入口保留作为回退。
 
 ## 安装
 
@@ -20,7 +20,7 @@ Magpie按package.json入口加载供应商；首次生图或自动登录时按�
 
 ### 本地安装
 
-本版实测macOS，要求Magpie、uv、Python3.12运行环境。运行 `sh install.sh`，安装固定Python依赖并通过 `magpie plugin add` 注册当前目录。只有新增账号时需要浏览器；优先复用本机Chrome或Playwright缓存，找不到时可安装 `playwright install chromium`。
+本版实测macOS，要求Magpie、uv、Python3.12运行环境。运行 `sh install.sh`，安装固定Python依赖并通过 `magpie plugin add` 注册当前目录。登录与原图下载需要浏览器；优先复用本机Chrome或Playwright缓存，找不到时可安装 `playwright install chromium`。
 
 Runtime：`~/.local/share/gemini-web-all/venv`，可通过GEMINI_WEB_ALL_RUNTIME指定。官网对话账号数据库仍由原生后端维护于 `~/.local/share/magpie-gemini-web`；AI Studio数据目录沿用原插件。凭据不打包、不进入Git。
 
@@ -29,9 +29,9 @@ Runtime：`~/.local/share/gemini-web-all/venv`，可通过GEMINI_WEB_ALL_RUNTIME
 ## 限制
 
 - 模型名是官网Pro档位别名，不证明底层图片模型的具体版本。
-- 图片任务单并发；失败不自动跨账号重试。进程中断先核查官网历史，避免重复生成。
+- 单账号图片任务单并发；失败不自动跨账号重试。进程中断先核查官网历史，避免重复生成。
 - 官网协议可能变化；依赖固定版本，升级需再次验收。
-- 自动Cookie收取已测试隔离浏览器启动和合成Cookie读取；未替用户重新登录Google，真实登录的人机验证仍需用户操作。
+- 首次绑定完整浏览器环境需用户在独立窗口登录；旧Cookie和账号记录保留。旧版已删除的临时浏览器环境不能由Cookie完整恢复。
 - 首版仅验证macOS，非跨平台承诺。
 
 ## 鸣谢
@@ -53,3 +53,14 @@ Runtime：`~/.local/share/gemini-web-all/venv`，可通过GEMINI_WEB_ALL_RUNTIME
 自动登录现在返回官网识别的账号邮箱，防止共用本地后端API Key时多个账号被合并。已有本地会话可通过“添加本地后端里已有的 Google 账号”重新关联，无需获取新Cookie。已使用三个现有会话验证能够识别三个不同账号；未重新执行密码登录。
 
 最新生图回归中，官网生成阶段通过，但完整尺寸下载返回HTTP 403，尚未修复；不应将本版描述为生图链路已恢复。错误记录已区分失败阶段和HTTP状态。
+
+## 0.2.0 持久化登录与原图下载
+
+- 每个账号使用独立持久化浏览器目录及锁；身份不匹配时拒绝使用，不跨账号回退。
+- 登录后保留浏览器存储；后台读取对应会话的当前Cookie，不覆盖旧账号数据库。
+- HTTP原图下载失败后，从同一账号的浏览器会话读取完整尺寸RPC结果；仍不回退预览图。
+- 已生成图片的恢复信息仅保存在本机私有runtime中；`python/recover.py` 接受标准输入 `{"job_id":"..."}`，只重试下载，不再次生图。
+- 2026-10-31：用户真实登录一个已有账号后，家具参考图生成及持久化浏览器原图下载成功，实测2752×1536、2881855字节，总耗时66.92秒。多账号隔离通过本地测试；第二账号端到端按用户要求暂缓。
+- 私有浏览器目录：`~/.local/share/gemini-web-all/profiles`。不要提交或分享其中内容。
+
+上面的0.1.1下载403状态为旧版记录；0.2.0增加已实测的浏览器下载路径，并不保证Google未来协议不变。

@@ -10,7 +10,7 @@ async def main():
    raw=base64.b64decode(item['data'],validate=True)
    if len(raw)>30*1024*1024:raise ValueError('Reference too large')
    p=Path(tmp)/f'ref-{i}';p.write_bytes(raw);refs.append(str(p))
-  job=await core.generate_image(request['prompt'],tmp,refs,'gemini-pro',request.get('account_id'))
+  job=await core.generate_image(request['prompt'],str(core.STATE/'originals'),refs,'gemini-pro',request.get('account_id'))
   if 'id' not in job:raise ValueError('Image service busy')
   await core.tasks[job['id']]
   result=await core.generation_result(job['id'])
