@@ -47,3 +47,9 @@ Runtime：`~/.local/share/gemini-web-all/venv`，可通过GEMINI_WEB_ALL_RUNTIME
 若官网返回 UNAUTHENTICATED，插件会明确提示重新登录，不将访客模式的Flash Lite列表解释成订阅权限或Pro额度耗尽。账号卡片存在、数据库状态enabled并不能证明官网会话仍有效。
 
 仓库已设置 `magpie-plugin` GitHub主题，符合Magpie社区仓库发现条件；是否立即出现取决于GitHub索引与Magpie缓存，不代表官方精选或审核背书。
+
+## 0.1.1 状态
+
+自动登录现在返回官网识别的账号邮箱，防止共用本地后端API Key时多个账号被合并。已有本地会话可通过“添加本地后端里已有的 Google 账号”重新关联，无需获取新Cookie。已使用三个现有会话验证能够识别三个不同账号；未重新执行密码登录。
+
+最新生图回归中，官网生成阶段通过，但完整尺寸下载返回HTTP 403，尚未修复；不应将本版描述为生图链路已恢复。错误记录已区分失败阶段和HTTP状态。

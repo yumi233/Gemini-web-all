@@ -1,5 +1,5 @@
 """Interactive login only; captures cookies from its own isolated browser context."""
-import asyncio,json,os,tempfile,time
+import asyncio,json,os,tempfile,time,re
 from pathlib import Path
 from playwright.async_api import async_playwright
 os.umask(0o077)
@@ -29,7 +29,9 @@ async def main():
       await asyncio.sleep(3)
       cookies=await browser.cookies(['https://gemini.google.com'])
       values={c['name']:c['value'] for c in cookies if c['domain'].lstrip('.') in ['google.com','gemini.google.com']}
-      print(json.dumps({'cookie':'; '.join(f'{k}={v}' for k,v in values.items())}),flush=True);return
+      html=await page.content()
+      match=re.search(r'"oPEP7c":"([^"@\s]+@[^"\s]+)"',html)
+      print(json.dumps({'cookie':'; '.join(f'{k}={v}' for k,v in values.items()),'email':match.group(1) if match else None}),flush=True);return
      await asyncio.sleep(2)
     raise ValueError('Login timed out; existing accounts were kept')
    finally:await browser.close()

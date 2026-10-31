@@ -90,7 +90,7 @@ async def run_job(job,prompt,refs,output,account_id,lock):
   job['image']=await full_download(client,images[0],directory)
   job['status']='completed';record(job)
  except BaseException as e:
-  job.update(status='failed',error_type=type(e).__name__,error=str(e) if isinstance(e,ValueError) else 'Website request failed; details suppressed to protect session data. No automatic resubmission.');record(job)
+  job.update(failed_stage=job.get('status'),http_status=getattr(getattr(e,'response',None),'status_code',None),status='failed',error_type=type(e).__name__,error=str(e) if isinstance(e,ValueError) else 'Website request failed; details suppressed to protect session data. No automatic resubmission.');record(job)
  finally:
   if client:await client.close()
   fcntl.flock(lock,fcntl.LOCK_UN);lock.close()
