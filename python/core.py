@@ -96,7 +96,10 @@ async def run_job(job,prompt,refs,output,account_id,lock):
   started=time.monotonic()
   response=await asyncio.wait_for(client.generate_content(prompt='Generate ONE image now. '+prompt,files=refs or None,model=available[job['model']]),timeout=600)
   images=[img for img in response.images if isinstance(img,GeneratedImage)]
-  if not images:raise ValueError('Website returned no generated image')
+  if not images:
+   diagnostics=STATE/'diagnostics';diagnostics.mkdir(exist_ok=True,mode=0o700)
+   (diagnostics/(job['id']+'.json')).write_text(json.dumps({'metadata':response.metadata,'text':response.text}))
+   raise ValueError('Website returned no generated image; response saved locally for diagnosis, no automatic resubmission')
   job['generation_seconds']=round(time.monotonic()-started,2)
   recovery={'account_id':aid,**{k:getattr(images[0],k) for k in ['cid','rid','rcid','image_id','url']}}
   recovery_dir=STATE/'recovery';recovery_dir.mkdir(exist_ok=True,mode=0o700)

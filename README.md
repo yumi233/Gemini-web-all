@@ -64,3 +64,7 @@ Runtime：`~/.local/share/gemini-web-all/venv`，可通过GEMINI_WEB_ALL_RUNTIME
 - 私有浏览器目录：`~/.local/share/gemini-web-all/profiles`。不要提交或分享其中内容。
 
 上面的0.1.1下载403状态为旧版记录；0.2.0增加已实测的浏览器下载路径，并不保证Google未来协议不变。
+
+## 0.2.1 参考图格式
+
+Magpie内联参考图按真实文件格式保存扩展名，保证上游上传使用图片MIME类型；官网无图片回复保存到本机私有诊断目录，禁止盲目自动重试。
