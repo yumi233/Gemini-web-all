@@ -1,0 +1,2820 @@
+diff --git a/internal/app/admin_cookies.go b/internal/app/admin_cookies.go
+index f17a675..c90f08a 100644
+--- a/internal/app/admin_cookies.go
++++ b/internal/app/admin_cookies.go
+@@ -85,9 +85,10 @@ func handleAdminCookies(w http.ResponseWriter, r *http.Request) {
+ 		})
+ 	case http.MethodPost:
+ 		var p struct {
+-			Label  string `json:"label"`
+-			Cookie string `json:"cookie"`
+-			Note   string `json:"note"`
++			Label   string `json:"label"`
++			Cookie  string `json:"cookie"`
++			Note    string `json:"note"`
++			ProxyID *int64 `json:"proxy_id"`
+ 		}
+ 		body, _ := io.ReadAll(r.Body)
+ 		if err := json.Unmarshal(body, &p); err != nil {
+@@ -99,6 +100,9 @@ func handleAdminCookies(w http.ResponseWriter, r *http.Request) {
+ 			writeJSON(w, 400, map[string]string{"error": err.Error()})
+ 			return
+ 		}
++		if p.ProxyID != nil && *p.ProxyID >= 0 {
++			bindAccountProxy(id, *p.ProxyID)
++		}
+ 		logf("[cookies] 新增账号 #%d label=%q", id, strings.TrimSpace(p.Label))
+ 		writeJSON(w, 200, map[string]interface{}{"id": id})
+ 	default:
+@@ -189,9 +193,10 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
+ 		writeJSON(w, 200, map[string]interface{}{"status": next})
+ 	case http.MethodPatch:
+ 		var p struct {
+-			Label  *string `json:"label"`
+-			Note   *string `json:"note"`
+-			Status *string `json:"status"`
++			Label   *string `json:"label"`
++			Note    *string `json:"note"`
++			Status  *string `json:"status"`
++			ProxyID *int64  `json:"proxy_id"`
+ 		}
+ 		body, _ := io.ReadAll(r.Body)
+ 		if err := json.Unmarshal(body, &p); err != nil {
+@@ -204,6 +209,9 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
+ 				return
+ 			}
+ 		}
++		if p.ProxyID != nil && *p.ProxyID >= 0 {
++			bindAccountProxy(id, *p.ProxyID)
++		}
+ 		if p.Label != nil || p.Note != nil {
+ 			// 只改传了的字段：没传的沿用当前值。
+ 			var curLabel, curNote string
+diff --git a/internal/app/argon.go b/internal/app/argon.go
+new file mode 100644
+index 0000000..a2a5e77
+--- /dev/null
++++ b/internal/app/argon.go
+@@ -0,0 +1,172 @@
++package app
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"slices"
++	"strings"
++	"time"
++)
++
++type argonIdentityError struct {
++	name string
++	id   string
++}
++
++func (e *argonIdentityError) Error() string {
++	return fmt.Sprintf("Argon model mismatch: upstream reported %q (%s)", e.name, e.id)
++}
++
++// argonDisplayNames 是上游对 Argon 各思考档位自报的显示名：普通档 "4 Argon"，
++// 扩展思考（think=2，上游叫 High）"4 Argon High"，中档（think=4）自报 "4 Argon" 或 "4 Argon Medium"。
++// 按请求的档位只认对应名字，档位被静默换掉也算身份不符。
++func argonDisplayNames(think int) []string {
++	if think == thinkingExtended {
++		return []string{"4 Argon High", "Gemini 4 Argon High"}
++	}
++	if think == thinkingMedium {
++		return []string{"4 Argon", "Gemini 4 Argon", "4 Argon Medium", "Gemini 4 Argon Medium"}
++	}
++	return []string{"4 Argon", "Gemini 4 Argon"}
++}
++
++// argonThinkFromHeader 从模型 header 下标 15 取思考档位；最小形式没有这一槽，按普通档。
++func argonThinkFromHeader(h []any) int {
++	if len(h) > 15 {
++		if f, ok := h[15].(float64); ok {
++			return int(f)
++		}
++	}
++	return thinkingNormal
++}
++
++// argonIdentityInLine 检查单行 wrb.fr 帧里的模型身份。
++// 返回 found=true 表示这行带有 names 之一的 Argon 身份；err 非 nil 表示这行报的是别的模型或档位。
++// 注意：2026-10 起上游在响应帧的 hex 槽位可能固定回 cf41b0e0dd7d53e5（hexFlashLite 占位），
++// 只有紧随其后的显示名槽位反映真实模型，因此 hex 槽位接受 hexArgon4 或 hexFlashLite 占位，同时严格核对显示名。
++func argonIdentityInLine(line string, names []string) (found bool, err error) {
++	var rows [][]json.RawMessage
++	if json.Unmarshal([]byte(line), &rows) != nil {
++		return false, nil
++	}
++	for _, row := range rows {
++		if len(row) < 3 {
++			continue
++		}
++		var kind, payload string
++		if json.Unmarshal(row[0], &kind) != nil || kind != "wrb.fr" || json.Unmarshal(row[2], &payload) != nil {
++			continue
++		}
++		var fields []any
++		if json.Unmarshal([]byte(payload), &fields) != nil {
++			continue
++		}
++		// Upstream reports model identity as consecutive top-level slots hex,null,null,name.
++		for i := 0; i+3 < len(fields); i++ {
++			id, ok := fields[i].(string)
++			if !ok || len(id) != 16 || fields[i+1] != nil || fields[i+2] != nil {
++				continue
++			}
++			validHex := true
++			for _, c := range id {
++				if !strings.ContainsRune("0123456789abcdef", c) {
++					validHex = false
++					break
++				}
++			}
++			name, ok := fields[i+3].(string)
++			if !validHex || !ok {
++				continue
++			}
++			if (id != hexArgon4 && id != hexFlashLite) || !slices.Contains(names, name) {
++				return false, &argonIdentityError{name: name, id: id}
++			}
++			found = true
++		}
++	}
++	return found, nil
++}
++
++var errArgonIdentityMissing = fmt.Errorf("Argon identity missing in upstream response; refusing unverified model")
++
++func validateArgonIdentity(raw []byte, names []string) error {
++	found := false
++	for _, line := range strings.Split(string(raw), "\n") {
++		ok, err := argonIdentityInLine(line, names)
++		if err != nil {
++			return err
++		}
++		found = found || ok
++	}
++	if !found {
++		return errArgonIdentityMissing
++	}
++	return nil
++}
++
++// readModelCheckedBody 对 Argon 请求逐帧校验模型身份后再转发。
++//
++// 身份确认之前的行先暂存、不回调；第一次在帧里确认是 Argon 时把暂存的行一次放行，
++// 之后边读边转发，同时继续检查每一帧。上游对未授权账号会静默降级成别的模型，
++// 所以：
++//   - 身份始终没出现、或首次出现就不对：一个字都不放行，返回错误；
++//   - 放行之后又报了别的模型：立刻停读并返回错误（调用方据此发流错误收尾）。
++//     已经发出去的内容收不回来，这是增量转发换首字延迟必须接受的代价。
++//
++// 实测身份跟首段正文在同一帧（Argon 探针：首帧 1.9s、身份与首字 9.5s、结束 14.6s），
++// 所以放行时机就是首字时机，不再要等上游整段生成完。
++//
++// onLine 为 nil（非流式）时没有转发，照旧读完整段再校验。
++func readModelCheckedBody(r io.Reader, onLine func(string) error, start time.Time, status int, modelHeader string) ([]byte, int64, error) {
++	var h []any
++	isArgon := json.Unmarshal([]byte(modelHeader), &h) == nil && len(h) > 4 && h[4] == hexArgon4
++	if !isArgon {
++		return readBody(r, onLine, start)
++	}
++	names := argonDisplayNames(argonThinkFromHeader(h))
++	if status != 200 || onLine == nil {
++		raw, ttfb, err := readBody(r, nil, start)
++		if err != nil || status != 200 {
++			return raw, ttfb, err
++		}
++		return raw, ttfb, validateArgonIdentity(raw, names)
++	}
++
++	var pending []string
++	verified := false
++	raw, ttfb, err := readBody(r, func(line string) error {
++		ok, lerr := argonIdentityInLine(line, names)
++		if lerr != nil {
++			return lerr
++		}
++		if !verified {
++			if !ok {
++				if line != "" {
++					pending = append(pending, line)
++				}
++				return nil
++			}
++			verified = true
++			for _, p := range pending {
++				if cerr := onLine(p); cerr != nil {
++					return cerr
++				}
++			}
++			pending = nil
++		}
++		if line != "" {
++			if cerr := onLine(line); cerr != nil {
++				return cerr
++			}
++		}
++		return nil
++	}, start)
++	if err != nil {
++		return raw, ttfb, err
++	}
++	if !verified {
++		return raw, ttfb, errArgonIdentityMissing
++	}
++	return raw, ttfb, nil
++}
+diff --git a/internal/app/argon_probe_test.go b/internal/app/argon_probe_test.go
+new file mode 100644
+index 0000000..dd9e687
+--- /dev/null
++++ b/internal/app/argon_probe_test.go
+@@ -0,0 +1,53 @@
++package app
++
++import (
++ "encoding/json"
++ "fmt"
++ "net/url"
++ "os"
++ "regexp"
++ "strings"
++ "testing"
++ "time"
++ "github.com/google/uuid"
++)
++
++// Explicitly opted-in local protocol probe. Does not log cookies, tokens, or raw account responses.
++func TestArgonProtocolProbe(t *testing.T) {
++ cookie := os.Getenv("ARGON_PROBE_COOKIE")
++ if cookie == "" { t.Skip("local authenticated probe not enabled") }
++ dbPath := cfg.DBPath
++ cfg = defaultConfig(); cfg.DBPath = dbPath; cfg.RequestTimeout = 65
++ initRuntimeConfig()
++ page, err := fetchAppPage(cookie, ""); if err != nil { t.Fatal("page fetch failed") }
++ tok := snlm0eRe.FindSubmatch(page); if len(tok)<2 {t.Fatal("login token unavailable")}
++ bl := regexp.MustCompile(`"cfb2h":"([^"]+)"`).FindSubmatch(page)
++ if len(bl)<2 {t.Fatal("build version unavailable")}
++ headers := buildGeminiHeaders(cookie,extractSAPISID(cookie), "")
++ delete(headers,"x-goog-ext-525001261-jspb")
++ freq,_:=json.Marshal([]any{[]any{[]any{"otAQ7b","[]",nil,"generic"}}})
++ form:=url.Values{"f.req":{string(freq)},"at":{string(tok[1])}}
++ endpoint:="https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=otAQ7b&hl=en&rt=c&bl="+url.QueryEscape(string(bl[1]))
++ status,_,catalog,err:=uploadPost(endpoint,headers,[]byte(form.Encode()),"")
++ if err!=nil {t.Fatal("catalog request failed")}
++ t.Logf("catalog_status=%d argon_hex_present=%v argon_name_present=%v",status,strings.Contains(string(catalog),"95a4c0abcba24364"),strings.Contains(string(catalog),"Argon"))
++ if !strings.Contains(string(catalog),"95a4c0abcba24364") {t.Fatal("Argon not confirmed in account catalog")}
++ if os.Getenv("ARGON_PROBE_CATALOG_ONLY")=="1" { return }
++ inner:=make([]any,97)
++ inner[0]=[]any{"Reply with exactly ARGON_OK.",0,nil,nil,nil,nil,0}
++ inner[1]=[]any{"en"};inner[2]=[]any{"","","",nil,nil,nil,nil,nil,nil,""}
++ inner[6]=[]any{0};inner[7]=1;inner[10]=1;inner[11]=0;inner[17]=[]any{[]any{0}}
++ inner[18]=0;inner[27]=1;inner[30]=[]any{4};inner[41]=[]any{1};inner[45]=1
++ inner[53]=0;inner[59]=uuid.NewString();inner[61]=[]any{};inner[68]=1;inner[79]=8;inner[80]=1;inner[91]=0;inner[96]=0
++ ib,_:=json.Marshal(inner);outer,_:=json.Marshal([]any{nil,string(ib)})
++ form=url.Values{"f.req":{string(outer)},"at":{string(tok[1])}}
++ headers=buildGeminiHeaders(cookie,extractSAPISID(cookie),"95a4c0abcba24364")
++ headers["x-goog-ext-525001261-jspb"]=buildModelHeader("95a4c0abcba24364",8,1,uuid.NewString())
++ headers["x-goog-ext-525005358-jspb"]=fmt.Sprintf(`["%s",1]`,inner[59])
++ endpoint="https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?hl=en&rt=c&bl="+url.QueryEscape(string(bl[1]))
++ start:=time.Now();status,raw,_,_,err:=doGeminiRequest(endpoint,form.Encode(),headers,"",nil)
++ if err!=nil {t.Fatalf("generation transport failed (%T)",err)}
++ actual:=extractUpstreamModel(string(raw));answer:=extractResponseText(string(raw))
++ t.Logf("generation_status=%d mode=8 think=1 actual_model=%q answer=%q elapsed_ms=%d raw_bytes=%d",status,actual,answer,time.Since(start).Milliseconds(),len(raw))
++ if status!=200 || !strings.Contains(strings.ToLower(actual),"argon") || strings.TrimSpace(answer)!="ARGON_OK" {t.Fatal("Argon generation not verified")}
++}
+diff --git a/internal/app/argon_test.go b/internal/app/argon_test.go
+new file mode 100644
+index 0000000..2f0b8cd
+--- /dev/null
++++ b/internal/app/argon_test.go
+@@ -0,0 +1,453 @@
++package app
++
++import (
++	"bytes"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++)
++
++func makeSyntheticArgonFrame(hexID string, modelName string, answer string) []byte {
++	fields := make([]any, 43)
++	if answer != "" {
++		fields[4] = answer
++	}
++	if hexID != "" {
++		fields[39] = hexID
++		fields[40] = nil
++		fields[41] = nil
++		fields[42] = modelName
++	}
++	payloadBytes, _ := json.Marshal(fields)
++	row := []any{"wrb.fr", "rpc1", string(payloadBytes), nil}
++	rows := [][]any{row}
++	lineBytes, _ := json.Marshal(rows)
++	return append(lineBytes, '\n')
++}
++
++func TestArgonValidateIdentity(t *testing.T) {
++	// 1. Correct hex and name passes (including upstream's hexFlashLite placeholder slot with Argon name)
++	validFrame1 := makeSyntheticArgonFrame(hexArgon4, "4 Argon", "ARGON_OK")
++	if err := validateArgonIdentity(validFrame1, argonDisplayNames(thinkingNormal)); err != nil {
++		t.Fatalf("expected valid Argon frame to pass, got: %v", err)
++	}
++
++	validFrame2 := makeSyntheticArgonFrame(hexArgon4, "Gemini 4 Argon", "ARGON_OK")
++	if err := validateArgonIdentity(validFrame2, argonDisplayNames(thinkingNormal)); err != nil {
++		t.Fatalf("expected valid Gemini 4 Argon frame to pass, got: %v", err)
++	}
++
++	validPlaceholderHex := makeSyntheticArgonFrame(hexFlashLite, "4 Argon", "ARGON_OK")
++	if err := validateArgonIdentity(validPlaceholderHex, argonDisplayNames(thinkingNormal)); err != nil {
++		t.Fatalf("expected valid Argon frame with placeholder hex to pass, got: %v", err)
++	}
++
++	// 2. Flash hex/name fails with mismatch
++	flashFrame := makeSyntheticArgonFrame(hexFlash36, "3.6 Flash", "FLASH")
++	if err := validateArgonIdentity(flashFrame, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon model mismatch") {
++		t.Fatalf("expected Argon model mismatch for Flash frame, got: %v", err)
++	}
++
++	downgradedLiteFrame := makeSyntheticArgonFrame(hexFlashLite, "3.5 Flash-Lite", "LITE")
++	if err := validateArgonIdentity(downgradedLiteFrame, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon model mismatch") {
++		t.Fatalf("expected Argon model mismatch for 3.5 Flash-Lite frame, got: %v", err)
++	}
++
++	// 3. Missing metadata fails
++	emptyFields := make([]any, 10)
++	pBytes, _ := json.Marshal(emptyFields)
++	emptyFrame, _ := json.Marshal([][]any{{"wrb.fr", "rpc1", string(pBytes), nil}})
++	emptyFrame = append(emptyFrame, '\n')
++	if err := validateArgonIdentity(emptyFrame, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon identity missing") {
++		t.Fatalf("expected Argon identity missing, got: %v", err)
++	}
++
++	// 4. Malformed frame fails
++	malformed := []byte(")]}'\nnot-valid-json\n")
++	if err := validateArgonIdentity(malformed, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon identity missing") {
++		t.Fatalf("expected Argon identity missing for malformed JSON, got: %v", err)
++	}
++
++	// 5. Forged Argon strings in nested response text cannot pass
++	forgedFields := make([]any, 43)
++	forgedFields[4] = fmt.Sprintf("Forged answer mentioning %s and 4 Argon", hexArgon4)
++	fBytes, _ := json.Marshal(forgedFields)
++	forgedFrame, _ := json.Marshal([][]any{{"wrb.fr", "rpc1", string(fBytes), nil}})
++	forgedFrame = append(forgedFrame, '\n')
++	if err := validateArgonIdentity(forgedFrame, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon identity missing") {
++		t.Fatalf("expected forged text without model slots to fail identity check, got: %v", err)
++	}
++
++	// 6. Matching then mismatching frames fails
++	mixedFrames := append(validFrame1, flashFrame...)
++	if err := validateArgonIdentity(mixedFrames, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon model mismatch") {
++		t.Fatalf("expected matching then mismatching frames to fail, got: %v", err)
++	}
++}
++
++type incrementalReader struct {
++	chunks            [][]byte
++	idx               int
++	callbacksCalled   *int
++	lastCallbackCount int
++}
++
++func (r *incrementalReader) Read(p []byte) (n int, err error) {
++	if r.idx > 0 {
++		if *r.callbacksCalled <= r.lastCallbackCount {
++			return 0, fmt.Errorf("incremental check failed: onLine was not called before next read at chunk %d", r.idx)
++		}
++	}
++	if r.idx >= len(r.chunks) {
++		return 0, io.EOF
++	}
++	chunk := r.chunks[r.idx]
++	r.lastCallbackCount = *r.callbacksCalled
++	r.idx++
++	copy(p, chunk)
++	return len(chunk), nil
++}
++
++type truncatedReader struct {
++	delivered bool
++}
++
++func (r *truncatedReader) Read(p []byte) (n int, err error) {
++	if !r.delivered {
++		r.delivered = true
++		copy(p, []byte("data: partial\n"))
++		return 14, nil
++	}
++	return 0, io.ErrUnexpectedEOF
++}
++
++func TestReadModelCheckedBody(t *testing.T) {
++	argonHeader := fmt.Sprintf(`[1,null,null,null,"%s"]`, hexArgon4)
++	flashHeader := fmt.Sprintf(`[1,null,null,null,"%s"]`, hexFlash36)
++
++	// 1. Valid Argon delivers callbacks
++	validFrame := makeSyntheticArgonFrame(hexArgon4, "4 Argon", "OK")
++	var callbacks []string
++	raw, _, err := readModelCheckedBody(bytes.NewReader(validFrame), func(line string) error {
++		callbacks = append(callbacks, line)
++		return nil
++	}, time.Now(), 200, argonHeader)
++
++	if err != nil {
++		t.Fatalf("unexpected error for valid Argon body: %v", err)
++	}
++	if len(callbacks) == 0 {
++		t.Fatal("expected callbacks for valid Argon body")
++	}
++	if !bytes.Equal(raw, validFrame) {
++		t.Fatal("raw body does not match")
++	}
++
++	// 2. Mismatch/missing -> err and zero callbacks
++	flashFrame := makeSyntheticArgonFrame(hexFlash36, "3.6 Flash", "OK")
++	callbacks = nil
++	_, _, err = readModelCheckedBody(bytes.NewReader(flashFrame), func(line string) error {
++		callbacks = append(callbacks, line)
++		return nil
++	}, time.Now(), 200, argonHeader)
++
++	if err == nil {
++		t.Fatal("expected error on mismatched model for Argon header")
++	}
++	if len(callbacks) != 0 {
++		t.Fatalf("expected 0 callbacks on mismatch, got %d", len(callbacks))
++	}
++
++	// 3. Non-200 Argon preserves status-body read with zero callbacks, no identity error
++	errorBody := []byte(`{"error":"bad request"}` + "\n")
++	callbacks = nil
++	rawErr, _, err := readModelCheckedBody(bytes.NewReader(errorBody), func(line string) error {
++		callbacks = append(callbacks, line)
++		return nil
++	}, time.Now(), 400, argonHeader)
++
++	if err != nil {
++		t.Fatalf("expected no error from readModelCheckedBody on non-200 status, got: %v", err)
++	}
++	if len(callbacks) != 0 {
++		t.Fatalf("expected zero callbacks on non-200 status, got %d", len(callbacks))
++	}
++	if !bytes.Equal(rawErr, errorBody) {
++		t.Fatal("expected status body to be preserved")
++	}
++
++	// 4. Ordinary model remains incremental
++	callbackCount := 0
++	incReader := &incrementalReader{
++		chunks: [][]byte{
++			[]byte("line 1\n"),
++			[]byte("line 2\n"),
++			[]byte("line 3\n"),
++		},
++		callbacksCalled: &callbackCount,
++	}
++
++	rawOrd, _, err := readModelCheckedBody(incReader, func(line string) error {
++		callbackCount++
++		return nil
++	}, time.Now(), 200, flashHeader)
++
++	if err != nil {
++		t.Fatalf("incremental ordinary model read failed: %v", err)
++	}
++	if callbackCount != 3 {
++		t.Fatalf("expected 3 incremental callbacks, got %d", callbackCount)
++	}
++	if !bytes.Equal(rawOrd, []byte("line 1\nline 2\nline 3\n")) {
++		t.Fatal("raw body mismatch for ordinary model")
++	}
++
++	// 5. Truncated reader errors, no Argon callbacks
++	callbacks = nil
++	trunc := &truncatedReader{}
++	_, _, err = readModelCheckedBody(trunc, func(line string) error {
++		callbacks = append(callbacks, line)
++		return nil
++	}, time.Now(), 200, argonHeader)
++
++	if !errors.Is(err, io.ErrUnexpectedEOF) {
++		t.Fatalf("expected io.ErrUnexpectedEOF, got: %v", err)
++	}
++	if len(callbacks) != 0 {
++		t.Fatalf("expected zero callbacks on truncated read, got %d", len(callbacks))
++	}
++}
++
++func TestArgonModelNeedsLoginAndAvailable(t *testing.T) {
++	mc, ok := Models["gemini-4-argon"]
++	if !ok {
++		t.Fatal("gemini-4-argon missing in Models map")
++	}
++	if !modelNeedsLogin(mc) {
++		t.Fatal("gemini-4-argon should require login")
++	}
++
++	// Without cookie: Argon hidden
++	if _, ok := availableModels()["gemini-4-argon"]; ok {
++		t.Fatal("gemini-4-argon should not be available without cookie")
++	}
++
++	// With cookie: Argon available
++	withPoolCookie(t)
++	if _, ok := availableModels()["gemini-4-argon"]; !ok {
++		t.Fatal("gemini-4-argon should be available when pool cookie exists")
++	}
++}
++
++// -thinking 版上游自报 "4 Argon High"：按请求 header 的思考位只认对应档位的名字，
++// 档位被静默换掉（要 High 回了普通档，或反过来）同样报身份不符。
++func TestArgonIdentityByThinkTier(t *testing.T) {
++	low := Models["gemini-4-argon"]
++	med := Models["gemini-4-argon-thinking-medium"]
++	high := Models["gemini-4-argon-thinking"]
++	if low.Thinking || !high.Thinking || high.HexID != hexArgon4 || high.Mode != 8 || med.ThinkWire != thinkingMedium {
++		t.Fatalf("unexpected Argon model table: low=%+v med=%+v high=%+v", low, med, high)
++	}
++	lowHeader := buildModelHeader(low.HexID, low.Mode, thinkingNormal, "uuid-x")
++	medHeader := buildModelHeader(med.HexID, med.Mode, thinkingMedium, "uuid-x")
++	highHeader := buildModelHeader(high.HexID, high.Mode, thinkingExtended, "uuid-x")
++
++	cases := []struct {
++		header, name string
++		ok           bool
++	}{
++		{lowHeader, "4 Argon", true},
++		{medHeader, "4 Argon", true},
++		{medHeader, "4 Argon Medium", true},
++		{highHeader, "4 Argon High", true},
++		{highHeader, "Gemini 4 Argon High", true},
++		{lowHeader, "4 Argon High", false},
++		{medHeader, "4 Argon High", false},
++		{highHeader, "4 Argon", false},
++	}
++	for _, c := range cases {
++		frame := makeSyntheticArgonFrame(hexArgon4, c.name, "ok")
++		var got []string
++		_, _, err := readModelCheckedBody(bytes.NewReader(frame), func(l string) error {
++			got = append(got, l)
++			return nil
++		}, time.Now(), 200, c.header)
++		if c.ok && (err != nil || len(got) == 0) {
++			t.Errorf("%q with header %s: want pass, err=%v lines=%d", c.name, c.header, err, len(got))
++		}
++		if !c.ok && (err == nil || !strings.Contains(err.Error(), "Argon model mismatch") || len(got) != 0) {
++			t.Errorf("%q with header %s: want mismatch and no output, err=%v lines=%d", c.name, c.header, err, len(got))
++		}
++		if _, _, err := readModelCheckedBody(bytes.NewReader(frame), nil, time.Now(), 200, c.header); (err == nil) != c.ok {
++			t.Errorf("%q non-stream with header %s: ok=%v err=%v", c.name, c.header, c.ok, err)
++		}
++	}
++}
++
++func TestArgonIdentityWithStrictModel(t *testing.T) {
++	setStrictModel(t, true)
++	low := Models["gemini-4-argon"]
++	med := Models["gemini-4-argon-thinking-medium"]
++	high := Models["gemini-4-argon-thinking"]
++
++	type tc struct {
++		mc             ModelConfig
++		name           string
++		wantPass       bool
++		wantDowngraded bool
++	}
++	cases := []tc{
++		{low, "4 Argon", true, false},
++		{low, "Gemini 4 Argon", true, false},
++		{med, "4 Argon", true, false},
++		{med, "Gemini 4 Argon", true, false},
++		{med, "4 Argon Medium", true, false},
++		{med, "Gemini 4 Argon Medium", true, false},
++		{high, "4 Argon High", true, false},
++		{high, "Gemini 4 Argon High", true, false},
++		// Tier mismatch within Argon: rejected by Argon identity check, NOT classified as model downgrade cooldown.
++		{low, "4 Argon High", false, false},
++		{low, "Gemini 4 Argon High", false, false},
++		{med, "4 Argon High", false, false},
++		{med, "Gemini 4 Argon High", false, false},
++		{high, "4 Argon", false, false},
++		{high, "Gemini 4 Argon", false, false},
++		// Silent downgrade to another model family: rejected and converted to ModelDowngradedError under strict_model.
++		{low, "3.5 Flash-Lite", false, true},
++		{low, "Gemini 3.5 Flash-Lite", false, true},
++		{med, "3.5 Flash-Lite", false, true},
++		{high, "3.6 Flash", false, true},
++	}
++
++	for _, c := range cases {
++		header := buildModelHeader(c.mc.HexID, c.mc.Mode, c.mc.thinkWire(), "uuid-x")
++		frame := makeSyntheticArgonFrame(hexFlashLite, c.name, "ok")
++
++		// Check both the streamGenerateOnce (newLineHandler) and streamGenerateConv (lineCB) pipelines.
++		for _, mode := range []string{"once", "conv"} {
++			strictCheck := strictLineCheck(c.mc, func() int64 { return 42 })
++			var cb func(string) error
++			if mode == "once" {
++				lh := newLineHandler(nil, nil, nil, strictCheck)
++				cb = lh.cb
++			} else {
++				cb = func(line string) error {
++					if strictCheck != nil {
++						if err := strictCheck(line); err != nil {
++							return err
++						}
++					}
++					return nil
++				}
++			}
++
++			_, _, err := readModelCheckedBody(bytes.NewReader(frame), cb, time.Now(), 200, header)
++			var aie *argonIdentityError
++			if strictCheck != nil && errors.As(err, &aie) && modelDowngraded(c.mc, aie.name) {
++				err = &ModelDowngradedError{Requested: c.mc.Upstream, Reported: aie.name, AccountID: 42}
++			}
++
++			if c.wantPass {
++				if err != nil {
++					t.Errorf("[%s] %q (think=%d): expected pass under strict_model, got %v", mode, c.name, c.mc.thinkWire(), err)
++				}
++				continue
++			}
++			if err == nil {
++				t.Errorf("[%s] %q (think=%d): expected error under strict_model, got nil", mode, c.name, c.mc.thinkWire())
++				continue
++			}
++			var mde *ModelDowngradedError
++			isDowngraded := errors.As(err, &mde)
++			if isDowngraded != c.wantDowngraded {
++				t.Errorf("[%s] %q (think=%d): wantDowngraded=%v, got err=%T (%v)", mode, c.name, c.mc.thinkWire(), c.wantDowngraded, err, err)
++			}
++		}
++	}
++}
++
++func TestTokenizerLoaderTimeout(t *testing.T) {
++	t.Setenv("TIKTOKEN_CACHE_DIR", t.TempDir())
++	prevTimeout := tokenizerHTTPTimeout
++	tokenizerHTTPTimeout = 80 * time.Millisecond
++	defer func() { tokenizerHTTPTimeout = prevTimeout }()
++
++	unblock := make(chan struct{})
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		<-unblock
++	}))
++	defer func() {
++		close(unblock)
++		srv.Close()
++	}()
++
++	loader := &boundedBpeLoader{}
++	start := time.Now()
++	_, err := loader.LoadTiktokenBpe(srv.URL + "/cl100k_base.tiktoken")
++	elapsed := time.Since(start)
++	if err == nil {
++		t.Fatal("expected timeout error from hanging tokenizer download")
++	}
++	if elapsed > 1500*time.Millisecond {
++		t.Fatalf("tokenizer download took %v, expected bounded timeout", elapsed)
++	}
++}
++
++func TestAdminCookiesBindProxyBeforeCheck(t *testing.T) {
++	getDB()
++	_, _ = getDB().Exec(`DELETE FROM proxies`)
++	_, _ = getDB().Exec(`DELETE FROM accounts`)
++	t.Cleanup(func() {
++		_, _ = getDB().Exec(`DELETE FROM proxies`)
++		_, _ = getDB().Exec(`DELETE FROM accounts`)
++		loadProxies()
++	})
++
++	idA, err := proxyCreate("proxy-a", "http://127.0.0.1:18080", 1)
++	if err != nil {
++		t.Fatalf("proxyCreate A: %v", err)
++	}
++	idB, err := proxyCreate("proxy-b", "http://127.0.0.1:18081", 1)
++	if err != nil {
++		t.Fatalf("proxyCreate B: %v", err)
++	}
++
++	reqBody, _ := json.Marshal(map[string]any{
++		"label":    "Magpie",
++		"cookie":   "SID=s; HSID=h; SSID=ss; APISID=a; SAPISID=sap; __Secure-1PSID=p",
++		"note":     "Added by Magpie",
++		"proxy_id": idB,
++	})
++	req := httptest.NewRequest(http.MethodPost, "/admin/api/cookies", bytes.NewReader(reqBody))
++	rec := httptest.NewRecorder()
++	handleAdminCookies(rec, req)
++	if rec.Code != 200 {
++		t.Fatalf("POST /admin/api/cookies status=%d body=%s", rec.Code, rec.Body.String())
++	}
++	var added struct {
++		ID int64 `json:"id"`
++	}
++	if err := json.Unmarshal(rec.Body.Bytes(), &added); err != nil || added.ID <= 0 {
++		t.Fatalf("unexpected response: %s", rec.Body.String())
++	}
++
++	accts := accountList()
++	if len(accts) != 1 || accts[0].ProxyID != idB {
++		t.Fatalf("expected account bound to proxy B (%d), got %+v (proxy A=%d)", idB, accts, idA)
++	}
++
++	picked, ok, err := acquireSlot(accts[0].ProxyID)
++	if !ok || err != nil {
++		t.Fatalf("acquireSlot failed: ok=%v err=%v", ok, err)
++	}
++	slotRelease(picked.ID)
++	if picked.ID != idB {
++		t.Fatalf("first check slot picked proxy %d (%s), want proxy B %d", picked.ID, picked.Name, idB)
++	}
++}
+diff --git a/internal/app/argon_timing_probe_test.go b/internal/app/argon_timing_probe_test.go
+new file mode 100644
+index 0000000..ae43ef4
+--- /dev/null
++++ b/internal/app/argon_timing_probe_test.go
+@@ -0,0 +1,74 @@
++package app
++
++import (
++ "encoding/json"
++ "fmt"
++ "net/url"
++ "os"
++ "regexp"
++ "strings"
++ "testing"
++ "time"
++ "github.com/google/uuid"
++ fhttp "github.com/bogdanfinn/fhttp"
++)
++
++// Explicitly opted-in local protocol probe. Does not log cookies, tokens, or raw account responses.
++func TestArgonTimingProbe(t *testing.T) {
++ cookie := os.Getenv("ARGON_PROBE_COOKIE")
++ if cookie == "" { t.Skip("local authenticated probe not enabled") }
++ dbPath := cfg.DBPath
++ cfg = defaultConfig(); cfg.DBPath = dbPath; cfg.RequestTimeout = 65
++ initRuntimeConfig()
++ page, err := fetchAppPage(cookie, ""); if err != nil { t.Fatal("page fetch failed") }
++ tok := snlm0eRe.FindSubmatch(page); if len(tok)<2 {t.Fatal("login token unavailable")}
++ bl := regexp.MustCompile(`"cfb2h":"([^"]+)"`).FindSubmatch(page)
++ if len(bl)<2 {t.Fatal("build version unavailable")}
++ headers := buildGeminiHeaders(cookie,extractSAPISID(cookie), "")
++ delete(headers,"x-goog-ext-525001261-jspb")
++ freq,_:=json.Marshal([]any{[]any{[]any{"otAQ7b","[]",nil,"generic"}}})
++ form:=url.Values{"f.req":{string(freq)},"at":{string(tok[1])}}
++ endpoint:="https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=otAQ7b&hl=en&rt=c&bl="+url.QueryEscape(string(bl[1]))
++ status,_,catalog,err:=uploadPost(endpoint,headers,[]byte(form.Encode()),"")
++ if err!=nil {t.Fatal("catalog request failed")}
++ t.Logf("catalog_status=%d argon_hex_present=%v argon_name_present=%v",status,strings.Contains(string(catalog),"95a4c0abcba24364"),strings.Contains(string(catalog),"Argon"))
++ if !strings.Contains(string(catalog),"95a4c0abcba24364") {t.Fatal("Argon not confirmed in account catalog")}
++ if os.Getenv("ARGON_PROBE_CATALOG_ONLY")=="1" { return }
++ inner:=make([]any,97)
++ inner[0]=[]any{"Explain how rain forms in 12 short numbered sentences. Begin directly with sentence 1.",0,nil,nil,nil,nil,0}
++ inner[1]=[]any{"en"};inner[2]=[]any{"","","",nil,nil,nil,nil,nil,nil,""}
++ inner[6]=[]any{0};inner[7]=1;inner[10]=1;inner[11]=0;inner[17]=[]any{[]any{0}}
++ inner[18]=0;inner[27]=1;inner[30]=[]any{4};inner[41]=[]any{1};inner[45]=1
++ inner[53]=0;inner[59]=uuid.NewString();inner[61]=[]any{};inner[68]=1;inner[79]=8;inner[80]=1;inner[91]=0;inner[96]=0
++ ib,_:=json.Marshal(inner);outer,_:=json.Marshal([]any{nil,string(ib)})
++ form=url.Values{"f.req":{string(outer)},"at":{string(tok[1])}}
++ headers=buildGeminiHeaders(cookie,extractSAPISID(cookie),"95a4c0abcba24364")
++ headers["x-goog-ext-525001261-jspb"]=buildModelHeader("95a4c0abcba24364",8,1,uuid.NewString())
++ headers["x-goog-ext-525005358-jspb"]=fmt.Sprintf(`["%s",1]`,inner[59])
++ endpoint="https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?hl=en&rt=c&bl="+url.QueryEscape(string(bl[1]))
++ start:=time.Now()
++ req,e:=fhttp.NewRequest("POST",endpoint,strings.NewReader(form.Encode()));if e!=nil{t.Fatal("request construction failed")}
++ for k,v:=range headers{req.Header.Set(k,v)}
++ resp,e:=getTLSClient().Do(req);if e!=nil{t.Fatalf("transport failed (%T)",e)}
++ defer resp.Body.Close()
++ status=resp.StatusCode
++ firstIdentity,firstText,firstReasoning,lastText:=int64(-1),int64(-1),int64(-1),int64(-1)
++ lineCount,textFrames:=0,0
++ lastContent:=""
++ raw,firstLine,err:=readBody(resp.Body,func(line string) error {
++  lineCount++;ms:=time.Since(start).Milliseconds()
++  if firstIdentity<0 && validateArgonIdentity([]byte(line), argonDisplayNames(thinkingNormal))==nil{firstIdentity=ms}
++  if firstReasoning<0 && reasoningInLine(line)!=""{firstReasoning=ms}
++  texts:=textsInLine(line)
++  if len(texts)>0 && strings.Join(texts,"\n")!=lastContent {
++   lastContent=strings.Join(texts,"\n");textFrames++;lastText=ms
++   if firstText<0{firstText=ms}
++  }
++  return nil
++ },start)
++ t.Logf("TIMING first_line_ms=%d first_identity_ms=%d first_text_ms=%d first_reasoning_ms=%d last_text_ms=%d complete_ms=%d lines=%d text_updates=%d",firstLine,firstIdentity,firstText,firstReasoning,lastText,time.Since(start).Milliseconds(),lineCount,textFrames)
++ if err!=nil {t.Fatalf("generation transport failed (%T)",err)}
++ actual:=extractUpstreamModel(string(raw));answer:=extractResponseText(string(raw))
++ t.Logf("generation_status=%d mode=8 think=1 actual_model=%q answer_bytes=%d elapsed_ms=%d raw_bytes=%d",status,actual,len(answer),time.Since(start).Milliseconds(),len(raw))
++ if status!=200 || !strings.Contains(strings.ToLower(actual),"argon") || strings.TrimSpace(answer)=="" {t.Fatal("Argon generation not verified")}
++}
+diff --git a/internal/app/cancel_test.go b/internal/app/cancel_test.go
+new file mode 100644
+index 0000000..f36c700
+--- /dev/null
++++ b/internal/app/cancel_test.go
+@@ -0,0 +1,106 @@
++package app
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++)
++
++// 客户端断开后必须真的掐掉上游连接：上游那头要能看到连接断了，而不是一直生成到结束。
++//
++// 假上游挂在代理那条路上（stdlib 客户端 + 代理），http:// 目标会以绝对 URI 发给代理，
++// 所以 httptest 服务器本身就能当上游，不用碰真网络。
++func TestCancelAbortsUpstreamStream(t *testing.T) {
++	upstreamGone := make(chan struct{})
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(200)
++		w.Write([]byte(")]}'\nfirst frame\n"))
++		w.(http.Flusher).Flush()
++		select {
++		case <-r.Context().Done():
++			close(upstreamGone)
++		case <-time.After(10 * time.Second): // 模拟一个还要生成很久的上游
++		}
++	}))
++	defer srv.Close()
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	start := time.Now()
++	_, _, _, _, err := doGeminiRequestStop(ctx, "http://upstream.invalid/StreamGenerate", "f.req=x",
++		map[string]string{}, srv.URL, func(line string) error {
++			if line == "first frame" {
++				cancel() // 客户端在收到首帧后走了
++			}
++			return nil
++		}, nil)
++	if err == nil {
++		t.Fatal("取消后应返回错误")
++	}
++	if took := time.Since(start); took > 3*time.Second {
++		t.Fatalf("取消后仍等了 %v 才返回", took)
++	}
++	select {
++	case <-upstreamGone:
++	case <-time.After(3 * time.Second):
++		t.Fatal("上游连接没有被关闭")
++	}
++}
++
++func TestSleepCtxCancels(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	go func() { time.Sleep(20 * time.Millisecond); cancel() }()
++	start := time.Now()
++	if err := sleepCtx(ctx, 10*time.Second); !errors.Is(err, context.Canceled) {
++		t.Fatalf("sleepCtx = %v", err)
++	}
++	if time.Since(start) > time.Second {
++		t.Fatal("重试等待没有随取消提前结束")
++	}
++	if err := sleepCtx(context.Background(), time.Millisecond); err != nil {
++		t.Fatal(err)
++	}
++}
++
++// 已经断开的请求不能再去占限流 slot、挑号、发上游。
++func TestStreamGenerateSkipsWhenCancelled(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	_, err := streamGenerateWithFiles(ctx, "hi", promptCtx{Latest: "hi"}, Models["gemini-3.5-flash-lite"], nil, nil, nil, nil)
++	if !errors.Is(err, context.Canceled) {
++		t.Fatalf("err = %v", err)
++	}
++}
++
++// 客户端断开：不写响应（没人收），requests 表记 499 而不是 502。
++func TestChatCompletionsClientGoneRecords499(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	body := `{"model":"gemini-3.5-flash-lite","messages":[{"role":"user","content":"cancel-probe-499"}]}`
++	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)).WithContext(ctx)
++	rec := httptest.NewRecorder()
++	handleChatCompletions(rec, req)
++	if rec.Body.Len() != 0 {
++		t.Fatalf("客户端已断开仍写了响应: %q", rec.Body.String())
++	}
++
++	deadline := time.Now().Add(3 * time.Second)
++	for time.Now().Before(deadline) {
++		var status int
++		var errStr string
++		row := getDB().QueryRow(`SELECT status, error FROM requests WHERE prompt_chars=? ORDER BY id DESC LIMIT 1`,
++			len("cancel-probe-499"))
++		if row.Scan(&status, &errStr) == nil {
++			if status != statusClientClosed || errStr != "client disconnected" {
++				t.Fatalf("记录 = %d %q，应为 499 client disconnected", status, errStr)
++			}
++			return
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++	t.Fatal("没有记录这次请求")
++}
+diff --git a/internal/app/client.go b/internal/app/client.go
+index c63b3a9..de635f7 100644
+--- a/internal/app/client.go
++++ b/internal/app/client.go
+@@ -200,6 +200,37 @@ func currentBrowserUA() string {
+ 	return ChromeUA
+ }
+ 
++var chromeHeaders = [][2]string{
++	{"User-Agent", ChromeUA},
++	{"Sec-CH-UA", `"Chromium";v="146", "Google Chrome";v="146", "Not?A_Brand";v="24"`},
++	{"Sec-CH-UA-Mobile", "?0"},
++	{"Sec-CH-UA-Platform", `"Windows"`},
++	{"Sec-Fetch-Dest", "empty"},
++	{"Sec-Fetch-Mode", "cors"},
++	{"Sec-Fetch-Site", "same-origin"},
++}
++
++// setChromeHeaders 把对应 impersonate 配置的应用层 header 填进 net/http 或 fhttp 的 Header。
++// 调用方之后再写自己的 header，同名的以调用方为准。
++func setChromeHeaders(h interface {
++	Set(key, value string)
++	Del(key string)
++}) {
++	if isFirefoxProfile() {
++		h.Set("User-Agent", FirefoxUA)
++		h.Del("Sec-CH-UA")
++		h.Del("Sec-CH-UA-Mobile")
++		h.Del("Sec-CH-UA-Platform")
++		h.Set("Sec-Fetch-Dest", "empty")
++		h.Set("Sec-Fetch-Mode", "cors")
++		h.Set("Sec-Fetch-Site", "same-origin")
++		return
++	}
++	for _, kv := range chromeHeaders {
++		h.Set(kv[0], kv[1])
++	}
++}
++
+ // applyChromeHeaders 给 stdlib 请求填上应用层 header（根据 impersonate 配置自动适配 Chrome 或 Firefox）。
+ func applyChromeHeaders(req *http.Request) {
+ 	applyBrowserHeaders(req)
+@@ -207,21 +238,5 @@ func applyChromeHeaders(req *http.Request) {
+ 
+ // applyBrowserHeaders 给 stdlib 请求填上对应 impersonate 配置的应用层 header。
+ func applyBrowserHeaders(req *http.Request) {
+-	if isFirefoxProfile() {
+-		req.Header.Set("User-Agent", FirefoxUA)
+-		req.Header.Del("Sec-CH-UA")
+-		req.Header.Del("Sec-CH-UA-Mobile")
+-		req.Header.Del("Sec-CH-UA-Platform")
+-		req.Header.Set("Sec-Fetch-Dest", "empty")
+-		req.Header.Set("Sec-Fetch-Mode", "cors")
+-		req.Header.Set("Sec-Fetch-Site", "same-origin")
+-		return
+-	}
+-	req.Header.Set("User-Agent", ChromeUA)
+-	req.Header.Set("Sec-CH-UA", `"Chromium";v="146", "Google Chrome";v="146", "Not?A_Brand";v="24"`)
+-	req.Header.Set("Sec-CH-UA-Mobile", "?0")
+-	req.Header.Set("Sec-CH-UA-Platform", `"Windows"`)
+-	req.Header.Set("Sec-Fetch-Dest", "empty")
+-	req.Header.Set("Sec-Fetch-Mode", "cors")
+-	req.Header.Set("Sec-Fetch-Site", "same-origin")
++	setChromeHeaders(req.Header)
+ }
+diff --git a/internal/app/context_file.go b/internal/app/context_file.go
+index bfc577b..cb60661 100644
+--- a/internal/app/context_file.go
++++ b/internal/app/context_file.go
+@@ -1,6 +1,7 @@
+ package app
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"strings"
+ )
+@@ -76,7 +77,11 @@ func contextFilePrompt(latest string, budget int) string {
+ //
+ // 上传失败**不静默回退到超长内联**：那样上游会把最新提问截掉，客户端拿到一个
+ // 答非所问的 200 却看不出问题。
+-func prepareContextFile(prompt, latest string, budget int, cookie, proxyURL string) (
++//
++// 附件里只放对话历史，工具协议（pc.Head / pc.Tail）留在正文：agentic 客户端的
++// 请求动辄十几万字节，几乎每轮都走这条路，工具说明和末尾锚点一旦进了附件，模型
++// 就不再稳定地吐 ```tool_call```。工具说明本身就超预算时才退回整段进附件。
++func prepareContextFile(ctx context.Context, prompt string, pc promptCtx, budget int, cookie, proxyURL string) (
+ 	string, []fileRef, bool, error) {
+ 	if budget <= 0 || len(prompt) <= budget {
+ 		return prompt, nil, false, nil
+@@ -84,11 +89,50 @@ func prepareContextFile(prompt, latest string, budget int, cookie, proxyURL stri
+ 	if cookie == "" {
+ 		return prompt, nil, false, nil // 匿名：引用会被回 1100，转了也没用
+ 	}
+-	ref, err := uploadBytes(cookie, proxyURL, []byte(prompt), contextFileName)
++	history, inline := planContextFile(prompt, pc, budget)
++	ref, err := uploadBytesCtx(ctx, cookie, proxyURL, []byte(history), contextFileName)
+ 	if err != nil {
+ 		return prompt, nil, false, fmt.Errorf("超长对话转附件失败: %w", err)
+ 	}
+-	logf("[context] prompt %d 字节超过 %d，已转成附件 %s", len(prompt), budget, contextFileName)
++	logf("[context] prompt %d 字节超过 %d，已转成附件 %s（附件 %d 字节，内联 %d 字节）",
++		len(prompt), budget, contextFileName, len(history), len(inline))
+ 	files := []fileRef{{Ref: ref, Name: contextFileName, Kind: 3, Mime: "text/plain"}}
+-	return contextFilePrompt(latest, budget), files, true, nil
++	return inline, files, true, nil
++}
++
++// planContextFile 决定附件里放什么、正文里内联什么。
++func planContextFile(prompt string, pc promptCtx, budget int) (history, inline string) {
++	history, inline = prompt, contextFilePrompt(pc.Latest, budget)
++	if h, ok := stripToolProtocol(prompt, pc); ok {
++		if withTools := joinPromptParts(pc.Head, inline, pc.Tail); len(withTools) <= budget {
++			history, inline = h, withTools
++		}
++	}
++	return history, inline
++}
++
++// stripToolProtocol 从拼好的 prompt 里去掉首尾的工具协议，只留对话历史。
++// 没有工具协议、或 prompt 不是按 pc 拼出来的，返回 ok=false。
++func stripToolProtocol(prompt string, pc promptCtx) (string, bool) {
++	if pc.Head == "" && pc.Tail == "" {
++		return prompt, false
++	}
++	body := prompt
++	if pc.Head != "" {
++		if !strings.HasPrefix(body, pc.Head) {
++			return prompt, false
++		}
++		body = strings.TrimPrefix(body[len(pc.Head):], "\n\n")
++	}
++	if pc.Tail != "" {
++		if !strings.HasSuffix(body, pc.Tail) {
++			return prompt, false
++		}
++		body = strings.TrimSuffix(body[:len(body)-len(pc.Tail)], "\n\n")
++	}
++	return body, true
++}
++
++func joinPromptParts(parts ...string) string {
++	return promptParts{body: parts}.join()
+ }
+diff --git a/internal/app/conversation.go b/internal/app/conversation.go
+index 74df391..401482e 100644
+--- a/internal/app/conversation.go
++++ b/internal/app/conversation.go
+@@ -1,6 +1,7 @@
+ package app
+ 
+ import (
++	"context"
+ 	"crypto/sha256"
+ 	"encoding/hex"
+ 	"encoding/json"
+@@ -206,7 +207,7 @@ func getAnonSession(proxyURL string) (string, error) {
+ 		if err != nil {
+ 			return nil, nil, nil, err
+ 		}
+-		r.Header.Set("User-Agent", currentBrowserUA())
++		setChromeHeaders(r.Header)
+ 		resp, err := getTLSClient().Do(r)
+ 		if err != nil {
+ 			return nil, nil, nil, err
+@@ -238,15 +239,14 @@ func getAnonSession(proxyURL string) (string, error) {
+ 	return strings.Join(pairs, "; "), nil
+ }
+ 
+-// webUA 是匿名 GET /app 的 User-Agent（tls-client 路径要手动带）。
+-const webUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+-	"(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+-
+ // streamGenerateConv 发一路会话的一轮。turn==0 是首轮（建会话），>0 是续接（只发新消息）。
+ // 整条会话绑定 conv.cookie / conv.proxyID，中途不换号不换出口。成功后回填 conv 的
+ // cid/rid/rcid/tok26 和 turn+1，供下一轮续接。
+-func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
++func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv *convState,
+ 	onDelta, onReasoning func(string)) (*StreamResult, error) {
++	if err := ctx.Err(); err != nil {
++		return &StreamResult{}, err
++	}
+ 	p, slotOK, slotErr := acquireSlot(conv.proxyID)
+ 	if !slotOK {
+ 		return &StreamResult{}, slotErr
+@@ -369,12 +369,19 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
+ 	t0 := time.Now()
+ 	var lastErr error
+ 	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
+-		statusCode, raw, ttfb, setCookie, err := doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
++		if cerr := ctx.Err(); cerr != nil {
++			return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID}, cerr
++		}
++		statusCode, raw, ttfb, setCookie, err := doGeminiRequestStop(ctx, endpoint, body, geminiHeaders, proxyURL, lineCB, nil)
+ 		if len(setCookie) > 0 && conv.cookie != "" {
+ 			if merged := mergeSetCookie(conv.cookie, setCookie); merged != conv.cookie {
+ 				conv.cookie = merged
+ 			}
+ 		}
++		var aie *argonIdentityError
++		if strictCheck != nil && errors.As(err, &aie) && modelDowngraded(mc, aie.name) {
++			err = &ModelDowngradedError{Requested: mc.Upstream, Reported: aie.name, AccountID: conv.accountID}
++		}
+ 		// 降级：同一个号重试还是降级，直接交给上层（见 gemini.go 同一处）。
+ 		var mde *ModelDowngradedError
+ 		if errors.As(err, &mde) {
+@@ -383,6 +390,9 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
+ 				Emitted: tracker.emitted, EmittedReasoning: rtracker.emitted}, err
+ 		}
+ 		if err != nil || statusCode != 200 || !hasContentFrame(string(raw)) {
++			if cerr := ctx.Err(); cerr != nil {
++				return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID}, cerr
++			}
+ 			if err == nil && statusCode == 200 {
+ 				lastErr = fmt.Errorf("续接无内容帧（会话可能已失效，raw %d 字节）", len(raw))
+ 			} else if err != nil {
+@@ -397,7 +407,9 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
+ 				break
+ 			}
+ 			if attempt < rtCfg().RetryAttempts-1 {
+-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
++				if werr := sleepCtx(ctx, time.Duration(rtCfg().RetryDelaySec)*time.Second); werr != nil {
++					return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID}, werr
++				}
+ 			}
+ 			continue
+ 		}
+@@ -438,7 +450,7 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
+ //   - 没命中 → 新建会话，首轮发全量拼接的历史（含 tools 指令，把当前上下文交给服务端）。
+ //
+ // 支持 tools（续接里也解析 ```tool_call``` 围栏）；图片走原单轮路径（callGemini）。
+-func callGeminiConv(messages []map[string]interface{}, mc ModelConfig,
++func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc ModelConfig,
+ 	tools []map[string]interface{}, toolChoice interface{},
+ 	onDelta, onReasoning func(string)) (string, []ToolCall, *StreamResult, error) {
+ 	parentKey := convParentKey(messages)
+@@ -488,7 +500,7 @@ func callGeminiConv(messages []map[string]interface{}, mc ModelConfig,
+ 				}
+ 			}
+ 		}
+-		res, err = streamGenerateConv(prompt, mc, conv, onDelta, onReasoning)
++		res, err = streamGenerateConv(ctx, prompt, mc, conv, onDelta, onReasoning)
+ 		if !retryOnAnotherAccount(res, err, mc, exclude) || !fresh {
+ 			break
+ 		}
+diff --git a/internal/app/cookie_pool.go b/internal/app/cookie_pool.go
+index 6a88ac2..dc828d6 100644
+--- a/internal/app/cookie_pool.go
++++ b/internal/app/cookie_pool.go
+@@ -546,6 +546,9 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
+ 		return CookieCheck{Detail: explainCookieFailure(err), ProxyName: name, TookMs: took}
+ 	}
+ 	markAccountResult(a.ID, true, "")
++	if picked.ID > 0 && a.ProxyID != picked.ID {
++		bindAccountProxy(a.ID, picked.ID)
++	}
+ 	detail := "登录态有效"
+ 	if extractSAPISID(a.Cookie) == "" {
+ 		detail += "，但缺 SAPISID（算不出授权头，部分接口会被当匿名）"
+diff --git a/internal/app/gemini.go b/internal/app/gemini.go
+index 7c9186f..a6b0213 100644
+--- a/internal/app/gemini.go
++++ b/internal/app/gemini.go
+@@ -3,6 +3,7 @@ package app
+ import (
+ 	"bufio"
+ 	"bytes"
++	"context"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+@@ -11,6 +12,7 @@ import (
+ 	"net/url"
+ 	"regexp"
+ 	"strings"
++	"sync/atomic"
+ 	"time"
+ 
+ 	fhttp "github.com/bogdanfinn/fhttp"
+@@ -373,7 +375,7 @@ func (e *pinnedAccountError) Unwrap() error { return e.Err }
+ // 自己做。一旦已经吐过内容就不再重试——重试会让客户端收到重复文本。
+ func streamGenerate(prompt, latest string, mc ModelConfig,
+ 	onDelta, onReasoning func(string)) (*StreamResult, error) {
+-	return streamGenerateWithFiles(prompt, latest, mc, nil, onDelta, onReasoning)
++	return streamGenerateWithFiles(context.Background(), prompt, promptCtx{Latest: latest}, mc, nil, onDelta, onReasoning, nil)
+ }
+ 
+ // fileRef 是一个已上传附件的引用。
+@@ -388,15 +390,23 @@ type fileRef struct {
+ //
+ // 附件填 inner[0][3]，形状 [[[ref, 1], "文件名"], …]。附件只在登录态可用：
+ // 匿名能把文件传上去，但对话里一引用就被服务端回 1100。
+-func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pendingUpload,
+-	onDelta, onReasoning func(string)) (*StreamResult, error) {
++//
++// stopWhen 非 nil 时，每帧拿当前累积正文问一次；返回 true 就不再读上游、按已收到
++// 的内容收尾。用于工具调用：围栏闭合时调用就已确定，上游最后一次改正文之后还要
++// 再推几秒收尾帧（Argon 实测约 2.3 秒），没必要让客户端干等。
++//
++// ctx 是客户端请求的 context：客户端断开后中止上游读取、上传和重试等待，不再替
++// 已经走掉的请求生成（否则账号照样被占用、重试还会再发一次，限流名额也一直占着）。
++// 取消导致的失败不记进代理 / cookie 健康度，那不是它们的错。
++func streamGenerateWithFiles(ctx context.Context, prompt string, pc promptCtx, mc ModelConfig, pending []pendingUpload,
++	onDelta, onReasoning func(string), stopWhen func(string) bool) (*StreamResult, error) {
+ 	// strict_model 换号：被降级的号记冷却、本次排除，换下一个号重来。上限跟 XSRF 换号
+ 	// 一样是 maxCookieTries——连着几个号都降级，说明池子整体见底，不是撞上个别号。
+ 	exclude := map[int64]bool{}
+ 	var res *StreamResult
+ 	var err error
+ 	for try := 0; try < maxCookieTries; try++ {
+-		next, nextErr := streamGenerateOnce(prompt, latest, mc, pending, onDelta, onReasoning, exclude)
++		next, nextErr := streamGenerateOnce(ctx, prompt, pc, mc, pending, onDelta, onReasoning, stopWhen, exclude)
+ 		var exhausted *ModelDowngradedError
+ 		if try > 0 && errors.As(nextErr, &exhausted) && exhausted.Reported == "" {
+ 			// 换号时已经没号可挑：报上一个号真实的降级（带自报模型名），补上解冻时间
+@@ -414,8 +424,8 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
+ 	return res, err
+ }
+ 
+-func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pendingUpload,
+-	onDelta, onReasoning func(string), exclude map[int64]bool) (*StreamResult, error) {
++func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc ModelConfig, pending []pendingUpload,
++	onDelta, onReasoning func(string), stopWhen func(string) bool, exclude map[int64]bool) (*StreamResult, error) {
+ 	var files []fileRef
+ 
+ 	// 先挑号，再按它上次绑的出口挑代理 —— 同一个账号要尽量固定从同一个 IP 出去，
+@@ -425,6 +435,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+ 	// 不发请求，真正发请求的是下面的 getXSRF，它在拿到 slot 之后。
+ 	// #20 匿名优先：不需要登录态能力时不占用 cookie 账号，走匿名省额度（见 anonFirstEligible）。
+ 	// 带附件（图/视频）时不能走匿名——下面 uploadBytes 那段会因 cookieStr=="" 直接报错。
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
+ 	var acct *CookieAccount
+ 	skip := exclude
+ 	if mc.PinAccountID > 0 {
+@@ -489,6 +502,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+ 	// 每个号只给一次「轮转后重试」的机会，避免在一个请求里反复打 accounts.google.com
+ 	rotatedOnce := map[int64]bool{}
+ 	for acct != nil && len(tried) < maxCookieTries {
++		if err := ctx.Err(); err != nil {
++			return attrib(err)
++		}
+ 		tried[acct.ID] = true
+ 		// 归属先记上：这一轮失败了也留痕，面板上看得出是哪个号在坏
+ 		cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
+@@ -569,7 +585,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+ 		}
+ 		nImg, nVid := 0, 0
+ 		for _, u := range pending {
+-			ref, uerr := uploadBytes(cookieStr, proxyURL, u.Data, u.Name)
++			ref, uerr := uploadBytesCtx(ctx, cookieStr, proxyURL, u.Data, u.Name)
++			if err := ctx.Err(); err != nil {
++				return attrib(err)
++			}
+ 			if uerr != nil {
+ 				return attrib(fmt.Errorf("上传附件 %s 失败: %w", u.Name, uerr))
+ 			}
+@@ -586,7 +605,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+ 	// prompt 超长时转成文本附件。要等挑完号和出口才能做：上传要 cookie，
+ 	// 而且必须走跟正式请求同一个出口。
+ 	budget := rtCfg().MaxPromptBytes
+-	if p, f, used, ferr := prepareContextFile(prompt, latest, budget, cookieStr, proxyURL); ferr != nil {
++	if p, f, used, ferr := prepareContextFile(ctx, prompt, pc, budget, cookieStr, proxyURL); ferr != nil {
++		if err := ctx.Err(); err != nil {
++			return attrib(err)
++		}
+ 		return attrib(ferr)
+ 	} else if used {
+ 		prompt = p
+@@ -713,45 +735,29 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+ 	xsrfRetried := false // XSRF 自愈只做一次，避免死循环
+ 	t0 := time.Now()
+ 
+-	tracker := &deltaTracker{}
+-	rtracker := &deltaTracker{}
+ 	strictCheck := strictLineCheck(mc, func() int64 { return cookieID })
+-	var lineCB func(string) error
+-	if onDelta != nil || onReasoning != nil || strictCheck != nil {
+-		lineCB = func(line string) error {
+-			if strictCheck != nil {
+-				if err := strictCheck(line); err != nil {
+-					return err
+-				}
+-			}
+-			// 思考链先推完才轮到正文，所以先处理它，客户端拿到的顺序才对。
+-			if onReasoning != nil {
+-				if r := reasoningInLine(line); r != "" {
+-					if d := rtracker.Push(r); d != "" {
+-						onReasoning(d)
+-					}
+-				}
+-			}
+-			if onDelta == nil {
+-				return nil
+-			}
+-			for _, t := range textsInLine(line) {
+-				if d := tracker.Push(t); d != "" {
+-					onDelta(d)
+-				}
+-			}
+-			return nil
+-		}
++	lh := newLineHandler(onDelta, onReasoning, stopWhen, strictCheck)
++	tracker, rtracker := lh.tracker, lh.rtracker
++
++	retryWait := func() error {
++		return sleepCtx(ctx, time.Duration(rtCfg().RetryDelaySec)*time.Second)
+ 	}
+ 
+ 	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
+-		statusCode, raw, ttfb, setCookie, err := doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
++		if err := ctx.Err(); err != nil {
++			return attrib(err)
++		}
++		statusCode, raw, ttfb, setCookie, err := doGeminiRequestStop(ctx, endpoint, body, geminiHeaders, proxyURL, lh.cb, &lh.stop)
+ 		if len(setCookie) > 0 && cookieID > 0 {
+ 			if merged := mergeSetCookie(cookieStr, setCookie); merged != cookieStr {
+ 				cookieStr = merged
+ 				updateAccountCookie(cookieID, merged)
+ 			}
+ 		}
++		var aie *argonIdentityError
++		if strictCheck != nil && errors.As(err, &aie) && modelDowngraded(mc, aie.name) {
++			err = &ModelDowngradedError{Requested: mc.Upstream, Reported: aie.name, AccountID: cookieID}
++		}
+ 		// 降级不是出口或 cookie 的错，也不该重试：同一个号再发一次还是降级。
+ 		var mde *ModelDowngradedError
+ 		if errors.As(err, &mde) {
+@@ -763,6 +769,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+ 			return res, err
+ 		}
+ 		if err != nil {
++			if cerr := ctx.Err(); cerr != nil {
++				return attrib(cerr) // 客户端断开，不是出口的错
++			}
+ 			lastErr = err
+ 			if pickedOK {
+ 				recordProxyResult(picked.ID, false, err.Error())
+@@ -773,7 +782,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+ 			}
+ 			if attempt < rtCfg().RetryAttempts-1 {
+ 				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
+-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
++				if werr := retryWait(); werr != nil {
++					return attrib(werr)
++				}
+ 			}
+ 			continue
+ 		}
+@@ -801,7 +812,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+ 				break
+ 			}
+ 			if attempt < rtCfg().RetryAttempts-1 {
+-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
++				if werr := retryWait(); werr != nil {
++					return attrib(werr)
++				}
+ 			}
+ 			continue
+ 		}
+@@ -829,7 +842,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+ 			}
+ 			if attempt < rtCfg().RetryAttempts-1 {
+ 				logf("retry %d/%d: 空响应（无内容帧，%d 字节）", attempt+1, rtCfg().RetryAttempts, len(raw))
+-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
++				if werr := retryWait(); werr != nil {
++					return attrib(werr)
++				}
+ 			}
+ 			continue
+ 		}
+@@ -895,6 +910,60 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+ 	return attrib(lastErr)
+ }
+ 
++// lineHandler 是每读到一行上游数据时的处理：推思考链、推正文增量、判断能否提前收尾。
++//
++// tracker / rtracker 记的是**已经发给客户端的**正文 / 思考链，调用方据此决定还能
++// 不能重试（吐过内容就不能重试，否则重复）。非流式也要逐帧看正文才能判断能否提前
++// 收尾，所以没有 onDelta 时另用一份 watch 记，不污染 tracker。
++type lineHandler struct {
++	tracker, rtracker *deltaTracker
++	stop              atomic.Bool
++	cb                func(string) error // nil 表示不需要逐行处理
++}
++
++func newLineHandler(onDelta, onReasoning func(string), stopWhen func(string) bool, check func(string) error) *lineHandler {
++	lh := &lineHandler{tracker: &deltaTracker{}, rtracker: &deltaTracker{}}
++	if onDelta == nil && onReasoning == nil && stopWhen == nil && check == nil {
++		return lh
++	}
++	watch := lh.tracker
++	if onDelta == nil {
++		watch = &deltaTracker{}
++	}
++	lh.cb = func(line string) error {
++		if check != nil {
++			if err := check(line); err != nil {
++				return err
++			}
++		}
++		// 思考链先推完才轮到正文，所以先处理它，客户端拿到的顺序才对。
++		if onReasoning != nil {
++			if r := reasoningInLine(line); r != "" {
++				if d := lh.rtracker.Push(r); d != "" {
++					onReasoning(d)
++				}
++			}
++		}
++		if onDelta == nil && stopWhen == nil {
++			return nil
++		}
++		grew := false
++		for _, t := range textsInLine(line) {
++			if d := watch.Push(t); d != "" {
++				grew = true
++				if onDelta != nil {
++					onDelta(d)
++				}
++			}
++		}
++		if grew && stopWhen != nil && stopWhen(watch.emitted) {
++			lh.stop.Store(true)
++		}
++		return nil
++	}
++	return lh
++}
++
+ // upstreamModelRe 匹配响应帧里服务端自报的模型显示名（帧的 [42] 位）。
+ // 形如 ...,"fbb127bbb056c959",null,null,"3.6 Flash",true,...
+ var upstreamModelRe = regexp.MustCompile(`\\"[0-9a-f]{16}\\",null,null,\\"([^"\\]{1,40})\\"`)
+@@ -964,10 +1033,43 @@ func buildGeminiHeaders(cookieStr, sapisid, hexID string) map[string]string {
+ // 实测号活一两小时就失效 —— 所以这些必须收下来并写回账号。
+ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL string,
+ 	onLine func(string) error) (int, []byte, int64, []string, error) {
++	return doGeminiRequestStop(context.Background(), endpoint, body, headers, proxyURL, onLine, nil)
++}
++
++// sleepCtx 等 d；ctx 先结束就提前返回它的错误。
++func sleepCtx(ctx context.Context, d time.Duration) error {
++	t := time.NewTimer(d)
++	defer t.Stop()
++	select {
++	case <-t.C:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
++// stopReader 在 stop 置位后让下一次 Read 直接返回 EOF：调用方已经拿到想要的内容，
++// 剩下的上游帧不再等。已经读进 Scanner 缓冲的行照常处理完。
++type stopReader struct {
++	r    io.Reader
++	stop *atomic.Bool
++}
++
++func (s stopReader) Read(p []byte) (int, error) {
++	if s.stop != nil && s.stop.Load() {
++		return 0, io.EOF
++	}
++	return s.r.Read(p)
++}
++
++// doGeminiRequestStop 同 doGeminiRequest，stop 置位后提前结束读取（见 stopReader），
++// ctx 结束时中止连接和读取。
++func doGeminiRequestStop(ctx context.Context, endpoint, body string, headers map[string]string, proxyURL string,
++	onLine func(string) error, stop *atomic.Bool) (int, []byte, int64, []string, error) {
+ 	sendAt := time.Now()
+ 	if proxyURL != "" {
+ 		// 走 stdlib 的 http.ProxyURL，已知能过 socks5/socks5h。
+-		req, err := http.NewRequest("POST", endpoint, strings.NewReader(body))
++		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(body))
+ 		if err != nil {
+ 			return 0, nil, 0, nil, err
+ 		}
+@@ -981,7 +1083,7 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL
+ 			return 0, nil, 0, nil, err
+ 		}
+ 		defer resp.Body.Close()
+-		raw, ttfb, err := readBody(resp.Body, onLine, sendAt)
++		raw, ttfb, err := readModelCheckedBody(stopReader{resp.Body, stop}, onLine, sendAt, resp.StatusCode, headers["x-goog-ext-525001261-jspb"])
+ 		if err != nil {
+ 			return resp.StatusCode, nil, ttfb, resp.Header.Values("Set-Cookie"), err
+ 		}
+@@ -989,10 +1091,11 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL
+ 	}
+ 
+ 	// 直连 → tls-client，保留 chrome146 TLS/HTTP2 真指纹
+-	req, err := fhttp.NewRequest("POST", endpoint, strings.NewReader(body))
++	req, err := fhttp.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(body))
+ 	if err != nil {
+ 		return 0, nil, 0, nil, err
+ 	}
++	setChromeHeaders(req.Header)
+ 	for k, v := range headers {
+ 		req.Header.Set(k, v)
+ 	}
+@@ -1002,7 +1105,7 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL
+ 		return 0, nil, 0, nil, err
+ 	}
+ 	defer resp.Body.Close()
+-	raw, ttfb, err := readBody(resp.Body, onLine, sendAt)
++	raw, ttfb, err := readModelCheckedBody(stopReader{resp.Body, stop}, onLine, sendAt, resp.StatusCode, headers["x-goog-ext-525001261-jspb"])
+ 	if err != nil {
+ 		return resp.StatusCode, nil, ttfb, resp.Header.Values("Set-Cookie"), err
+ 	}
+@@ -1313,6 +1416,7 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
+ 			res.Diagnostic = "构建请求失败: " + e.Error()
+ 			return res
+ 		}
++		setChromeHeaders(req.Header)
+ 		for k, v := range headers {
+ 			req.Header.Set(k, v)
+ 		}
+diff --git a/internal/app/gemini_api.go b/internal/app/gemini_api.go
+index 3721e44..d5950ab 100644
+--- a/internal/app/gemini_api.go
++++ b/internal/app/gemini_api.go
+@@ -1,6 +1,7 @@
+ package app
+ 
+ import (
++	"context"
+ 	"encoding/base64"
+ 	"encoding/json"
+ 	"fmt"
+@@ -458,6 +459,7 @@ func geminiCandidate(parts []interface{}, finish string) map[string]interface{}
+ // prepareGemini 是 generateContent / streamGenerateContent 共用的前半段：
+ // 解析、选模型、收图、拼 prompt。出错时已经写好响应。
+ type geminiCall struct {
++	ctx        context.Context
+ 	req        *geminiAPIRequest
+ 	modelName  string
+ 	modelCfg   ModelConfig
+@@ -466,7 +468,7 @@ type geminiCall struct {
+ 	toolChoice interface{}
+ 	images     []pendingUpload
+ 	prompt     string
+-	latest     string
++	pc         promptCtx
+ }
+ 
+ func prepareGemini(w http.ResponseWriter, r *http.Request, model string) (*geminiCall, bool) {
+@@ -492,21 +494,21 @@ func prepareGemini(w http.ResponseWriter, r *http.Request, model string) (*gemin
+ 		writeGeminiError(w, 400, err.Error())
+ 		return nil, false
+ 	}
+-	prompt, latest := messagesToPrompt(messages, tools, toolChoice)
++	prompt, pc := messagesToPrompt(messages, tools, toolChoice)
+ 	if strings.TrimSpace(prompt) == "" && len(images) == 0 {
+ 		writeGeminiError(w, 400, "contents is empty")
+ 		return nil, false
+ 	}
+-	return &geminiCall{req: req, modelName: modelName, modelCfg: modelCfg, messages: messages,
+-		tools: tools, toolChoice: toolChoice, images: images, prompt: prompt, latest: latest}, true
++	return &geminiCall{ctx: r.Context(), req: req, modelName: modelName, modelCfg: modelCfg, messages: messages,
++		tools: tools, toolChoice: toolChoice, images: images, prompt: prompt, pc: pc}, true
+ }
+ 
+ // run 调上游；多轮开关的分流跟 /v1/chat/completions 一致。
+ func (g *geminiCall) run(onDelta, onReasoning func(string)) (string, []ToolCall, *StreamResult, error) {
+ 	if rtCfg().MultiTurn && len(g.images) == 0 && g.modelCfg.Tool == 0 {
+-		return callGeminiConv(g.messages, g.modelCfg, g.tools, g.toolChoice, onDelta, onReasoning)
++		return callGeminiConv(g.ctx, g.messages, g.modelCfg, g.tools, g.toolChoice, onDelta, onReasoning)
+ 	}
+-	return callGemini(g.prompt, g.latest, g.modelCfg, g.tools, g.images, onDelta, onReasoning)
++	return callGemini(g.ctx, g.prompt, g.pc, g.modelCfg, g.tools, g.images, onDelta, onReasoning)
+ }
+ 
+ // runGeminiCall 是调上游那一步，测试里替换成桩。
+@@ -521,6 +523,9 @@ func handleGenerateContent(w http.ResponseWriter, r *http.Request, model string)
+ 	}
+ 	text, calls, res, err := runGeminiCall(g, nil, nil)
+ 	if err != nil {
++		if clientGone(r, "gemini.generateContent", g.modelName, g.prompt, res, false) {
++			return
++		}
+ 		status := 502
+ 		if _, ok := err.(*ModelDowngradedError); ok {
+ 			status = 429
+@@ -656,6 +661,9 @@ func handleStreamGenerateContent(w http.ResponseWriter, r *http.Request, model s
+ 
+ 	text, calls, res, err := runGeminiCall(g, onDelta, onReasoning)
+ 	if err != nil {
++		if clientGone(r, "gemini.streamGenerateContent", g.modelName, g.prompt, res, true) {
++			return
++		}
+ 		status := 502
+ 		if _, ok := err.(*ModelDowngradedError); ok {
+ 			status = 429
+diff --git a/internal/app/gemini_test.go b/internal/app/gemini_test.go
+index 00eb305..2b4c6ca 100644
+--- a/internal/app/gemini_test.go
++++ b/internal/app/gemini_test.go
+@@ -15,6 +15,7 @@ func TestModelHeader(t *testing.T) {
+ 		{"gemini-3.6-flash", hexFlash36},
+ 		{"gemini-3.5-flash-lite", hexFlashLite},
+ 		{"gemini-3.1-pro", hexPro31},
++		{"gemini-4-argon", hexArgon4},
+ 	}
+ 	for _, c := range cases {
+ 		name, mc, err := resolveModel(c.name)
+diff --git a/internal/app/headers_test.go b/internal/app/headers_test.go
+new file mode 100644
+index 0000000..9613045
+--- /dev/null
++++ b/internal/app/headers_test.go
+@@ -0,0 +1,98 @@
++package app
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	tls_client "github.com/bogdanfinn/tls-client"
++)
++
++// 同一个账号的请求不能因为走没走代理而呈现两种客户端：两条路径都要带齐 chromeHeaders，
++// 调用方自己的 header 照样生效。直连那条以前一个都不带，UA 是 Go-http-client/2.0。
++//
++// 直连走 tls-client，这里换成跳过证书校验的同款客户端，打本机的 HTTPS 测试服务器；
++// 代理那条把 http:// 目标以绝对 URI 发给代理，测试服务器本身就能当代理（同 cancel_test）。
++func TestDirectAndProxyPathsSendSameBrowserHeaders(t *testing.T) {
++	got := map[string]http.Header{}
++	record := func(name string) http.Handler {
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			got[name] = r.Header.Clone()
++			w.WriteHeader(200)
++		})
++	}
++	direct := httptest.NewUnstartedServer(record("direct"))
++	direct.EnableHTTP2 = true
++	direct.StartTLS()
++	defer direct.Close()
++	proxy := httptest.NewServer(record("proxy"))
++	defer proxy.Close()
++
++	imp := effectiveImpersonate()
++	key := fmt.Sprintf("%s|%d", imp, rtCfg().RequestTimeout)
++	insecure, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(),
++		tls_client.WithClientProfile(resolveProfile(imp)),
++		tls_client.WithInsecureSkipVerify(),
++		tls_client.WithNotFollowRedirects())
++	if err != nil {
++		t.Fatal(err)
++	}
++	clientCacheMu.Lock()
++	prev, had := clientCache[key]
++	clientCache[key] = insecure
++	clientCacheMu.Unlock()
++	t.Cleanup(func() {
++		clientCacheMu.Lock()
++		defer clientCacheMu.Unlock()
++		if had {
++			clientCache[key] = prev
++		} else {
++			delete(clientCache, key)
++		}
++	})
++
++	own := map[string]string{"Accept-Language": "en-US,en;q=0.9", "X-Same-Domain": "1"}
++	paths := []struct {
++		name string
++		send func(endpoint, proxyURL string)
++	}{
++		{"StreamGenerate", func(endpoint, proxyURL string) {
++			doGeminiRequestStop(context.Background(), endpoint, "f.req=x", own, proxyURL, nil, nil)
++		}},
++		{"upload", func(endpoint, proxyURL string) {
++			uploadPostCtx(context.Background(), endpoint, own, []byte("x"), proxyURL)
++		}},
++		{"media", func(endpoint, proxyURL string) {
++			mediaGetOnce(endpoint, own, proxyURL)
++		}},
++		{"image", func(endpoint, proxyURL string) {
++			fetchImage(endpoint, proxyURL, 0)
++		}},
++	}
++	for _, p := range paths {
++		clear(got)
++		p.send(direct.URL+"/x", "")
++		p.send("http://upstream.invalid/x", proxy.URL)
++		d, pr := got["direct"], got["proxy"]
++		if d == nil || pr == nil {
++			t.Fatalf("%s: 没收到请求（direct=%v proxy=%v）", p.name, d != nil, pr != nil)
++		}
++		if ua := d.Get("User-Agent"); ua != ChromeUA {
++			t.Errorf("%s: 直连 UA = %q", p.name, ua)
++		}
++		for _, kv := range chromeHeaders {
++			if d.Get(kv[0]) != pr.Get(kv[0]) {
++				t.Errorf("%s: %s 直连 %q，代理 %q", p.name, kv[0], d.Get(kv[0]), pr.Get(kv[0]))
++			}
++		}
++		if p.name != "image" {
++			for k, v := range own {
++				if d.Get(k) != v || pr.Get(k) != v {
++					t.Errorf("%s: 调用方的 %s 没生效（直连 %q，代理 %q）", p.name, k, d.Get(k), pr.Get(k))
++				}
++			}
++		}
++	}
++}
+diff --git a/internal/app/latency_test.go b/internal/app/latency_test.go
+new file mode 100644
+index 0000000..236a51d
+--- /dev/null
++++ b/internal/app/latency_test.go
+@@ -0,0 +1,310 @@
++package app
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"io"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// SIDCC 每个响应都刷新，XSRF 缓存不能因此失效，否则每个登录态请求都多抓一次 /app。
++func TestXSRFCacheSurvivesSIDCCRefresh(t *testing.T) {
++	cookie := "SAPISID=sap; __Secure-1PSID=psid; SIDCC=old; __Secure-1PSIDCC=old"
++	refreshed := mergeSetCookie(cookie, []string{"SIDCC=new; Path=/", "__Secure-1PSIDCC=new; Path=/"})
++	if refreshed == cookie {
++		t.Fatal("测试前提不成立：合并后 cookie 没变")
++	}
++	if cookieKey(cookie) != cookieKey(refreshed) {
++		t.Fatal("同一账号刷新 SIDCC 后缓存键变了")
++	}
++	if cookieKey(cookie) == cookieKey("SAPISID=other; __Secure-1PSID=psid2") {
++		t.Fatal("不同账号撞了缓存键")
++	}
++	if cookieKey("a=1") == cookieKey("a=2") {
++		t.Fatal("没有身份项时应退回按整串区分")
++	}
++
++	key := cookieKey(cookie)
++	xsrfMu.Lock()
++	xsrfCache[key] = xsrfEntry{token: "tok", fetched: time.Now()}
++	xsrfMu.Unlock()
++	t.Cleanup(func() { invalidateXSRF(cookie) })
++
++	// 命中缓存时不发网络请求；这里 proxyURL 指向不可达地址，真去抓会报错。
++	tok, err := getXSRF(refreshed, "http://127.0.0.1:1")
++	if err != nil || tok != "tok" {
++		t.Fatalf("刷新后的 cookie 没命中缓存: tok=%q err=%v", tok, err)
++	}
++}
++
++func toolsFixture(names ...string) []map[string]interface{} {
++	var out []map[string]interface{}
++	for _, n := range names {
++		out = append(out, map[string]interface{}{
++			"type": "function",
++			"function": map[string]interface{}{
++				"name":        n,
++				"description": "Run <cmd> & report",
++				"parameters": map[string]interface{}{
++					"type": "object",
++					"properties": map[string]interface{}{
++						"command": map[string]interface{}{"type": "string"},
++					},
++					"required": []interface{}{"command"},
++				},
++			},
++		})
++	}
++	return out
++}
++
++func TestToolSchemaIsCompact(t *testing.T) {
++	msgs := []map[string]interface{}{{"role": "user", "content": "hi"}}
++	p, pc := messagesToPrompt(msgs, toolsFixture("bash"), nil)
++	if strings.Contains(pc.Head, "\n  \"") {
++		t.Error("工具定义仍是缩进格式")
++	}
++	if strings.Contains(pc.Head, `\u00`) || !strings.Contains(pc.Head, "Run <cmd> & report") {
++		t.Error("工具描述里的 HTML 字符被转义了")
++	}
++	if pc.Tail == "" || !strings.HasPrefix(p, pc.Head) || !strings.HasSuffix(p, pc.Tail) {
++		t.Fatal("prompt 首尾应分别是工具说明和末尾锚点")
++	}
++	if p != buildPrompt(msgs, toolsFixture("bash"), nil) {
++		t.Fatal("messagesToPrompt 和 buildPrompt 结果不一致")
++	}
++}
++
++// 超长转附件时，工具说明和末尾锚点留在正文，附件里只有历史。
++func TestContextFileKeepsToolProtocolInline(t *testing.T) {
++	msgs := longConversation(300)
++	prompt, pc := messagesToPrompt(msgs, toolsFixture("bash", "read"), nil)
++	budget := len(prompt) / 2
++
++	history, inline := planContextFile(prompt, pc, budget)
++	if strings.Contains(history, pc.Head) || strings.Contains(history, pc.Tail) {
++		t.Fatal("工具协议跟着历史进了附件")
++	}
++	if !strings.HasPrefix(inline, pc.Head) || !strings.HasSuffix(inline, pc.Tail) {
++		t.Fatal("正文里没保留工具协议")
++	}
++	if !strings.Contains(inline, contextFileName) || !strings.Contains(inline, "读取一下 task.md") {
++		t.Fatal("正文缺少附件指引或最新提问")
++	}
++	if !strings.Contains(history, "历史填充内容") || len(inline) > budget {
++		t.Fatalf("附件缺历史或正文超预算（%d > %d）", len(inline), budget)
++	}
++
++	// 工具说明本身就超预算：退回整段进附件，至少不撞墙。
++	history, inline = planContextFile(prompt, pc, len(pc.Head)/2)
++	if history != prompt || strings.Contains(inline, pc.Head) {
++		t.Fatal("工具说明超预算时应整段进附件")
++	}
++
++	// 没有工具：跟原来一样整段进附件。
++	plain, ppc := messagesToPrompt(msgs, nil, nil)
++	if history, _ := planContextFile(plain, ppc, len(plain)/2); history != plain {
++		t.Fatal("没有工具时附件内容变了")
++	}
++}
++
++func TestToolCallComplete(t *testing.T) {
++	done := toolCallComplete(toolsFixture("bash"))
++	cases := []struct {
++		text string
++		want bool
++	}{
++		{"先说两句", false},
++		{"```tool_call\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}", false},     // 未闭合
++		{"```tool_call\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}\n``", false}, // 闭合到一半
++		{"```tool_call\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}\n```", true},
++		{"好的\n```tool_call {\"name\":\"bash\",\"arguments\":{}}```", true},
++		{"```tool_call\n{\"name\": \"rm_rf\", \"arguments\": {}}\n```", false},                         // 不认识的函数
++		{"```tool_call\n{\"name\": \"bash\", \"arguments\": {\"command\": \"echo ```\"}}\n```", false}, // 参数里有围栏，解析不完整
++	}
++	for _, c := range cases {
++		if got := done(c.text); got != c.want {
++			t.Errorf("toolCallComplete(%q) = %v, want %v", c.text, got, c.want)
++		}
++	}
++	if toolCallComplete(nil) != nil {
++		t.Error("没有工具时不应做判定")
++	}
++}
++
++// countingReader 按块吐数据并记录被读了几次。
++type countingReader struct {
++	chunks [][]byte
++	reads  int
++}
++
++func (r *countingReader) Read(p []byte) (int, error) {
++	if r.reads >= len(r.chunks) {
++		return 0, io.EOF
++	}
++	n := copy(p, r.chunks[r.reads])
++	r.reads++
++	return n, nil
++}
++
++func TestStopReaderEndsReadEarly(t *testing.T) {
++	src := &countingReader{chunks: [][]byte{[]byte("a\n"), []byte("b\n"), []byte("c\n"), []byte("d\n")}}
++	var stop atomic.Bool
++	var got []string
++	_, _, err := readBody(stopReader{src, &stop}, func(line string) error {
++		got = append(got, line)
++		if line == "b" {
++			stop.Store(true)
++		}
++		return nil
++	}, time.Now())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if strings.Join(got, ",") != "a,b" || src.reads != 2 {
++		t.Fatalf("置位后仍在读上游: lines=%v reads=%d", got, src.reads)
++	}
++}
++
++func argonLine(hexID, name, answer string) []byte {
++	return makeSyntheticArgonFrame(hexID, name, answer)
++}
++
++func TestArgonIncrementalForwarding(t *testing.T) {
++	header := fmt.Sprintf(`[1,null,null,null,"%s"]`, hexArgon4)
++	noID := argonLine("", "", "x")
++
++	// 身份晚到：之前的帧先扣住，确认后按原顺序放行。
++	var got []string
++	body := bytes.Join([][]byte{[]byte(")]}'\n"), noID, argonLine(hexArgon4, "4 Argon", "ok")}, nil)
++	_, _, err := readModelCheckedBody(bytes.NewReader(body), func(l string) error {
++		got = append(got, l)
++		return nil
++	}, time.Now(), 200, header)
++	if err != nil || len(got) != 3 || got[0] != ")]}'" {
++		t.Fatalf("晚到身份: err=%v lines=%d", err, len(got))
++	}
++
++	// 确认之后增量转发：每读一块就要回调，不能攒到结尾。
++	calls := 0
++	inc := &incrementalReader{
++		chunks:          [][]byte{argonLine(hexArgon4, "4 Argon", "a"), argonLine(hexArgon4, "4 Argon", "ab"), noID},
++		callbacksCalled: &calls,
++	}
++	if _, _, err := readModelCheckedBody(inc, func(string) error {
++		calls++
++		return nil
++	}, time.Now(), 200, header); err != nil || calls != 3 {
++		t.Fatalf("确认后未增量转发: err=%v calls=%d", err, calls)
++	}
++
++	// 先对后错：已放行的收不回，但必须报错并停读。
++	got = nil
++	src := &countingReader{chunks: [][]byte{
++		argonLine(hexArgon4, "4 Argon", "a"),
++		argonLine(hexFlash36, "3.6 Flash", "b"),
++		argonLine(hexArgon4, "4 Argon", "c"),
++	}}
++	_, _, err = readModelCheckedBody(src, func(l string) error {
++		got = append(got, l)
++		return nil
++	}, time.Now(), 200, header)
++	if err == nil || !strings.Contains(err.Error(), "mismatch") || len(got) != 1 || src.reads != 2 {
++		t.Fatalf("先对后错: err=%v lines=%d reads=%d", err, len(got), src.reads)
++	}
++
++	// 始终没有身份：一行都不放行。
++	got = nil
++	_, _, err = readModelCheckedBody(bytes.NewReader(bytes.Repeat(noID, 3)), func(l string) error {
++		got = append(got, l)
++		return nil
++	}, time.Now(), 200, header)
++	if err == nil || !strings.Contains(err.Error(), "identity missing") || len(got) != 0 {
++		t.Fatalf("无身份: err=%v lines=%d", err, len(got))
++	}
++
++	// 非流式（onLine 为 nil）仍整段校验。
++	if _, _, err := readModelCheckedBody(bytes.NewReader(noID), nil, time.Now(), 200, header); err == nil {
++		t.Fatal("非流式无身份应报错")
++	}
++}
++
++// 后台重取失败时必须作废缓存，否则失效的号会一直拿着旧 token 被当成可用。
++func TestRefreshAppTokensFailureDropsCache(t *testing.T) {
++	cookie := "SAPISID=sap2; __Secure-1PSID=psid2"
++	xsrfMu.Lock()
++	xsrfCache[cookieKey(cookie)] = xsrfEntry{token: "stale", fetched: time.Now()}
++	xsrfMu.Unlock()
++	t.Cleanup(func() { invalidateXSRF(cookie) })
++
++	refreshAppTokens(cookieKey(cookie), cookie, "http://127.0.0.1:1")
++	xsrfMu.Lock()
++	_, ok := xsrfCache[cookieKey(cookie)]
++	xsrfMu.Unlock()
++	if ok {
++		t.Fatal("重取失败后缓存仍在")
++	}
++}
++
++// genFrame 造一行 StreamGenerate 帧：inner[4] 带累积正文，argon=true 时带上模型身份槽。
++func genFrame(text string, argon bool) []byte {
++	inner := make([]any, 43)
++	inner[0] = "padding-to-pass-the-minimum-frame-length-checks-in-textsInLine"
++	inner[4] = []any{[]any{"rc_test", []any{text}}}
++	if argon {
++		inner[39], inner[40], inner[41], inner[42] = hexArgon4, nil, nil, "4 Argon"
++	}
++	ib, _ := json.Marshal(inner)
++	line, _ := json.Marshal([]any{[]any{"wrb.fr", nil, string(ib)}})
++	return append(line, '\n')
++}
++
++// 端到端：工具块闭合那一帧之后不再读上游，客户端只收到围栏外的正文，最终能解析出调用。
++func TestToolCallStopsUpstreamRead(t *testing.T) {
++	call := "```tool_call\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}\n```"
++	texts := []string{"好的", "好的\n```tool_call\n{\"name\": \"ba", "好的\n" + call, "好的\n" + call, "好的\n" + call}
++	for _, argon := range []bool{false, true} {
++		hexID := hexFlash36
++		if argon {
++			hexID = hexArgon4
++		}
++		var frames [][]byte
++		for _, tx := range texts {
++			frames = append(frames, genFrame(tx, argon))
++		}
++		src := &countingReader{chunks: frames}
++		var sent strings.Builder
++		gate := newToolFenceGate(func(s string) { sent.WriteString(s) })
++		lh := newLineHandler(gate.Push, nil, toolCallComplete(toolsFixture("bash")), nil)
++
++		raw, _, err := readModelCheckedBody(stopReader{src, &lh.stop}, lh.cb, time.Now(), 200,
++			fmt.Sprintf(`[1,null,null,null,"%s"]`, hexID))
++		if err != nil {
++			t.Fatalf("argon=%v: %v", argon, err)
++		}
++		if !lh.stop.Load() || src.reads != 3 {
++			t.Fatalf("argon=%v: 工具块闭合后仍在读上游（reads=%d，应为 3）", argon, src.reads)
++		}
++		if sent.String() != "好的\n" {
++			t.Fatalf("argon=%v: 围栏原文漏给了客户端: %q", argon, sent.String())
++		}
++		_, calls := parseToolCalls(extractResponseText(string(raw)))
++		if len(calls) != 1 || calls[0].Function.Name != "bash" || calls[0].Function.Arguments != `{"command":"ls"}` {
++			t.Fatalf("argon=%v: 提前收尾后解析不出调用: %+v", argon, calls)
++		}
++	}
++
++	// 非流式（onDelta 为 nil）同样提前收尾，但不能把 tracker 记成「已发给客户端」，否则失败时不能重试。
++	src := &countingReader{chunks: [][]byte{genFrame("好的\n"+call, false), genFrame("好的\n"+call, false)}}
++	lh := newLineHandler(nil, nil, toolCallComplete(toolsFixture("bash")), nil)
++	if _, _, err := readModelCheckedBody(stopReader{src, &lh.stop}, lh.cb, time.Now(), 200, `[1,null,null,null,"x"]`); err != nil {
++		t.Fatal(err)
++	}
++	if !lh.stop.Load() || src.reads != 1 || lh.tracker.emitted != "" {
++		t.Fatalf("非流式: stop=%v reads=%d tracker=%q", lh.stop.Load(), src.reads, lh.tracker.emitted)
++	}
++}
+diff --git a/internal/app/mcp_media.go b/internal/app/mcp_media.go
+index acb1131..a8bab02 100644
+--- a/internal/app/mcp_media.go
++++ b/internal/app/mcp_media.go
+@@ -1,6 +1,7 @@
+ package app
+ 
+ import (
++	"context"
+ 	"encoding/base64"
+ 	"encoding/json"
+ 	"fmt"
+@@ -71,7 +72,7 @@ func mcpGenerateMedia(model, prompt string, refs []string) (map[string]interface
+ 		}
+ 		images = append(images, img)
+ 	}
+-	_, _, res, err := callGemini(prompt, prompt, mc, nil, images, nil, nil)
++	_, _, res, err := callGemini(context.Background(), prompt, promptCtx{Latest: prompt}, mc, nil, images, nil, nil)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/internal/app/media.go b/internal/app/media.go
+index 23d09b8..060df77 100644
+--- a/internal/app/media.go
++++ b/internal/app/media.go
+@@ -748,6 +748,7 @@ func mediaGetOnce(rawURL string, headers map[string]string, proxyURL string) (in
+ 	if err != nil {
+ 		return 0, nil, nil, err
+ 	}
++	setChromeHeaders(req.Header)
+ 	for k, v := range headers {
+ 		req.Header.Set(k, v)
+ 	}
+diff --git a/internal/app/messages.go b/internal/app/messages.go
+index 376171f..87b91fe 100644
+--- a/internal/app/messages.go
++++ b/internal/app/messages.go
+@@ -46,8 +46,50 @@ type ToolCallFunction struct {
+ // 出口才知道能不能做，所以判断放在 streamGenerate 里。最新那条消息单独返回，
+ // 转附件时用来内联，好让模型不必去文件里找问题。
+ func messagesToPrompt(messages []map[string]interface{}, tools []map[string]interface{},
+-	toolChoice interface{}) (string, string) {
+-	return buildPrompt(messages, tools, toolChoice), latestUserMessage(messages)
++	toolChoice interface{}) (string, promptCtx) {
++	pp := buildPromptParts(messages, tools, toolChoice)
++	return pp.join(), promptCtx{Latest: latestUserMessage(messages), Head: pp.head, Tail: pp.tail}
++}
++
++// promptCtx 是拼好的 prompt 之外、超长转附件时仍要内联的部分。
++//
++// 工具协议（Head：格式说明 + schema；Tail：末尾锚点提醒）不能跟着历史一起进附件：
++// 末尾锚点是模型肯吐 ```tool_call``` 的关键（见 buildPromptParts 里的判据），
++// 整段塞进 message.txt 后正文只剩一句「去读附件」，锚点就失效了。
++type promptCtx struct {
++	Latest string // 最新那条用户消息
++	Head   string // 工具格式说明与定义，没有工具时为空
++	Tail   string // 末尾的工具锚点提醒，没有工具时为空
++}
++
++// promptParts 是 prompt 的三段：工具说明、对话历史、末尾提醒。
++type promptParts struct {
++	head string
++	body []string
++	tail string
++}
++
++func (pp promptParts) join() string {
++	var nonEmpty []string
++	for _, p := range append(append([]string{pp.head}, pp.body...), pp.tail) {
++		if p != "" {
++			nonEmpty = append(nonEmpty, p)
++		}
++	}
++	return strings.Join(nonEmpty, "\n\n")
++}
++
++// compactJSON 不缩进、不转义 HTML 字符。工具 schema 原来用 MarshalIndent，
++// 缩进空白和 \u003c 这类转义全算进 prompt 字节预算，agentic 客户端几十个工具时
++// 很容易把请求推过转附件的门槛。
++func compactJSON(v interface{}) string {
++	var b strings.Builder
++	enc := json.NewEncoder(&b)
++	enc.SetEscapeHTML(false)
++	if err := enc.Encode(v); err != nil {
++		return ""
++	}
++	return strings.TrimSuffix(b.String(), "\n")
+ }
+ 
+ // latestUserMessage 取最后一条 user 消息的正文，没有则返回空串。
+@@ -65,6 +107,12 @@ func latestUserMessage(messages []map[string]interface{}) string {
+ 
+ func buildPrompt(messages []map[string]interface{}, tools []map[string]interface{},
+ 	toolChoice interface{}) string {
++	return buildPromptParts(messages, tools, toolChoice).join()
++}
++
++func buildPromptParts(messages []map[string]interface{}, tools []map[string]interface{},
++	toolChoice interface{}) promptParts {
++	var pp promptParts
+ 	var parts []string
+ 
+ 	toolsInjected := false
+@@ -89,7 +137,7 @@ func buildPrompt(messages []map[string]interface{}, tools []map[string]interface
+ 			})
+ 		}
+ 		if len(defs) > 0 {
+-			defsJSON, _ := json.MarshalIndent(defs, "", "  ")
++			defsJSON := compactJSON(defs)
+ 			rule := "Only use tool_call blocks when needed."
+ 			switch {
+ 			case forced != "":
+@@ -102,13 +150,13 @@ func buildPrompt(messages []map[string]interface{}, tools []map[string]interface
+ 					"and nothing else — do not answer the question yourself, even if you " +
+ 					"know the answer."
+ 			}
+-			parts = append(parts, fmt.Sprintf(
++			pp.head = fmt.Sprintf(
+ 				"[System instruction]: You have access to tools. "+
+ 					"To call a tool, respond with:\n"+
+ 					"```tool_call\n{\"name\": \"func_name\", \"arguments\": {...}}\n```\n"+
+ 					"%s\n\n"+
+-					"Available tools:\n%s", rule, string(defsJSON),
+-			))
++					"Available tools:\n%s", rule, defsJSON,
++			)
+ 			toolsInjected = true
+ 		}
+ 	}
+@@ -165,33 +213,27 @@ func buildPrompt(messages []map[string]interface{}, tools []map[string]interface
+ 	// 工具名（shell_command）0/4 抄假名 —— 示例教的是「动作」不是名字，故不必按客户端
+ 	// 动态生成 schema。
+ 	if toolsInjected {
+-		parts = append(parts,
+-			"[System instruction — highest priority]: To run a command or read a file you MUST "+
+-				"output a ```tool_call``` block — this is the ONLY execution channel. A "+
+-				"```powershell/```bash/```cmd/```python code block is NOT executed, it is only shown "+
+-				"to the user; never use one to run anything, and never claim you lack tools.\n"+
+-				"Act, do not explain: when the request needs a tool, your reply is ONE ```tool_call``` "+
+-				"block and nothing else — do not list the commands you 'would' run, do not output more "+
+-				"than one tool_call, do not add prose. If several steps are needed, do the FIRST one "+
+-				"now; you will be called again with its result to continue.\n"+
+-				"Know when to STOP: once a tool result shows a step succeeded (for example it exited "+
+-				"with code 0, even with no printed output), that step is DONE — do not run it again and "+
+-				"do not retry the same thing a different way. When the whole request is accomplished, "+
+-				"stop calling tools and reply with a short final answer instead of another tool_call.\n"+
+-				"Example of a correct turn — user asks \"list the files here and tell me the size of "+
+-				"README.md\", you reply with exactly one block and nothing else:\n"+
+-				"```tool_call\n{\"name\": \"run_command\", \"arguments\": {\"command\": \"ls -la\"}}\n```\n"+
+-				"(In your block use one of the real tool names listed above with its own arguments.) "+
+-				"When the request needs a tool, emit the tool_call block now.")
++		pp.tail = "[System instruction — highest priority]: To run a command or read a file you MUST " +
++			"output a ```tool_call``` block — this is the ONLY execution channel. A " +
++			"```powershell/```bash/```cmd/```python code block is NOT executed, it is only shown " +
++			"to the user; never use one to run anything, and never claim you lack tools.\n" +
++			"Act, do not explain: when the request needs a tool, your reply is ONE ```tool_call``` " +
++			"block and nothing else — do not list the commands you 'would' run, do not output more " +
++			"than one tool_call, do not add prose. If several steps are needed, do the FIRST one " +
++			"now; you will be called again with its result to continue.\n" +
++			"Know when to STOP: once a tool result shows a step succeeded (for example it exited " +
++			"with code 0, even with no printed output), that step is DONE — do not run it again and " +
++			"do not retry the same thing a different way. When the whole request is accomplished, " +
++			"stop calling tools and reply with a short final answer instead of another tool_call.\n" +
++			"Example of a correct turn — user asks \"list the files here and tell me the size of " +
++			"README.md\", you reply with exactly one block and nothing else:\n" +
++			"```tool_call\n{\"name\": \"run_command\", \"arguments\": {\"command\": \"ls -la\"}}\n```\n" +
++			"(In your block use one of the real tool names listed above with its own arguments.) " +
++			"When the request needs a tool, emit the tool_call block now."
+ 	}
+ 
+-	var nonEmpty []string
+-	for _, p := range parts {
+-		if p != "" {
+-			nonEmpty = append(nonEmpty, p)
+-		}
+-	}
+-	return strings.Join(nonEmpty, "\n\n")
++	pp.body = parts
++	return pp
+ }
+ 
+ func contentToString(content interface{}) string {
+@@ -392,6 +434,47 @@ func parseToolCalls(text string) (string, []ToolCall) {
+ 	return strings.TrimSpace(clean), toolCalls
+ }
+ 
++// toolCallComplete 返回一个判定函数：累积正文里出现了**闭合且能解析**、函数名在
++// tools 里的 ```tool_call``` 块时为真，表示这一轮的工具调用已经确定，可以不等上游
++// 收尾。没有工具时返回 nil（不做判定）。
++//
++// 提示词要求一轮只出一个 tool_call 块、不带别的正文（见 buildPromptParts 末尾锚点），
++// 所以第一个合法块闭合就收尾。函数名不认识或 JSON 不完整时不收尾，照旧等上游
++// 结束 —— 宁可慢，不把半截或错的调用当成结果。
++func toolCallComplete(tools []map[string]interface{}) func(string) bool {
++	names := map[string]bool{}
++	for _, tool := range tools {
++		fn := tool
++		if f, ok := tool["function"].(map[string]interface{}); ok {
++			fn = f
++		}
++		if n := getStr(fn, "name"); n != "" {
++			names[n] = true
++		}
++	}
++	if len(names) == 0 {
++		return nil
++	}
++	return func(text string) bool {
++		i := strings.Index(text, toolFenceOpen)
++		if i < 0 {
++			return false
++		}
++		m := toolCallRe.FindStringSubmatch(text[i:])
++		if m == nil {
++			return false
++		}
++		var data struct {
++			Name      string                 `json:"name"`
++			Arguments map[string]interface{} `json:"arguments"`
++		}
++		if json.Unmarshal([]byte(strings.TrimSpace(m[1])), &data) != nil {
++			return false
++		}
++		return names[data.Name]
++	}
++}
++
+ // parseToolChoice 解析 OpenAI 的 tool_choice。
+ // 返回 (mode, forcedName)：mode ∈ {"auto","none","required"}；
+ // forcedName 非空表示客户端点名了某个函数。
+diff --git a/internal/app/server.go b/internal/app/server.go
+index b451d12..b0dbbd3 100644
+--- a/internal/app/server.go
++++ b/internal/app/server.go
+@@ -1,6 +1,7 @@
+ package app
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+@@ -10,7 +11,7 @@ import (
+ 	"time"
+ )
+ 
+-const Version = "4.26.0"
++const Version = "4.26.0-magpie.1"
+ 
+ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+ 	body, _ := json.Marshal(data)
+@@ -43,6 +44,7 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
+ 	writeJSON(w, 200, map[string]interface{}{
+ 		"status":  "ok",
+ 		"version": Version,
+ 		"models":  modelNames,
++		"capabilities": map[string]bool{"account_proxy_binding": true},
+ 	})
+ }
+@@ -130,9 +131,9 @@ func rejectUnsupported(req map[string]interface{}, messages []map[string]interfa
+ 	return nil
+ }
+ 
+-func callGemini(prompt, latest string, mc ModelConfig, tools []map[string]interface{},
++func callGemini(ctx context.Context, prompt string, pc promptCtx, mc ModelConfig, tools []map[string]interface{},
+ 	images []pendingUpload, onDelta, onReasoning func(string)) (string, []ToolCall, *StreamResult, error) {
+-	res, err := streamGenerateWithFiles(prompt, latest, mc, images, onDelta, onReasoning)
++	res, err := streamGenerateWithFiles(ctx, prompt, pc, mc, images, onDelta, onReasoning, toolCallComplete(tools))
+ 	if err != nil {
+ 		// res 非 nil：失败时它只带归属（哪个号 / 哪个出口），给 recordRequest 用
+ 		return "", nil, res, err
+@@ -268,7 +269,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	prompt, latest := messagesToPrompt(messages, tools, req["tool_choice"])
++	prompt, pc := messagesToPrompt(messages, tools, req["tool_choice"])
+ 	if strings.TrimSpace(prompt) == "" && len(images) == 0 {
+ 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": "empty prompt"}})
+ 		return
+@@ -305,11 +306,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+ 	var res *StreamResult
+ 	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
+ 		// 多轮：按历史前缀识别续接，命中就只发新消息、历史留服务端。带 tools 也走这条。
+-		text, toolCalls, res, err = callGeminiConv(messages, modelCfg, tools, req["tool_choice"], onDelta, onReasoning)
++		text, toolCalls, res, err = callGeminiConv(r.Context(), messages, modelCfg, tools, req["tool_choice"], onDelta, onReasoning)
+ 	} else {
+-		text, toolCalls, res, err = callGemini(prompt, latest, modelCfg, tools, images, onDelta, onReasoning)
++		text, toolCalls, res, err = callGemini(r.Context(), prompt, pc, modelCfg, tools, images, onDelta, onReasoning)
+ 	}
+ 	if err != nil {
++		if clientGone(r, "chat.completions", modelName, prompt, res, stream) {
++			return
++		}
+ 		mde, downgraded := err.(*ModelDowngradedError)
+ 		status := 502
+ 		if downgraded {
+@@ -400,6 +404,21 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+ 	})
+ }
+ 
++// statusClientClosed 是客户端先断开时记进 requests 表的状态码（沿用 nginx 的 499）。
++const statusClientClosed = 499
++
++// clientGone 判断失败是不是因为客户端已经断开；是的话记一条 499 并返回 true。
++//
++// 这时连接已经没了，再写 502 / 流错误没人收。记成 502 会让「用户自己取消」看起来
++// 像上游故障；499 + "client disconnected" 在面板的失败列表里一眼能分清。
++func clientGone(r *http.Request, endpoint, model, prompt string, res *StreamResult, stream bool) bool {
++	if r.Context().Err() == nil {
++		return false
++	}
++	recordRequest(endpoint, model, prompt, "", res, statusClientClosed, "client disconnected", stream)
++	return true
++}
++
+ // usageOf 是 buildUsageWithReasoning 的便捷包装，res 可能为 nil。
+ func usageOf(prompt, text string, res *StreamResult) map[string]int {
+ 	r := ""
+@@ -575,7 +594,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	prompt, latest := messagesToPrompt(messages, tools, req["tool_choice"])
++	prompt, pc := messagesToPrompt(messages, tools, req["tool_choice"])
+ 	if strings.TrimSpace(prompt) == "" && len(images) == 0 {
+ 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": "empty input"}})
+ 		return
+@@ -669,11 +688,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
+ 	var toolCalls []ToolCall
+ 	var res *StreamResult
+ 	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
+-		text, toolCalls, res, err = callGeminiConv(messages, modelCfg, tools, req["tool_choice"], onDelta, nil)
++		text, toolCalls, res, err = callGeminiConv(r.Context(), messages, modelCfg, tools, req["tool_choice"], onDelta, nil)
+ 	} else {
+-		text, toolCalls, res, err = callGemini(prompt, latest, modelCfg, tools, images, onDelta, nil)
++		text, toolCalls, res, err = callGemini(r.Context(), prompt, pc, modelCfg, tools, images, onDelta, nil)
+ 	}
+ 	if err != nil {
++		if clientGone(r, "responses", modelName, prompt, res, stream) {
++			return
++		}
+ 		mde, downgraded := err.(*ModelDowngradedError)
+ 		status := 502
+ 		if downgraded {
+diff --git a/internal/app/strict_model.go b/internal/app/strict_model.go
+index ecc17ac..88267c5 100644
+--- a/internal/app/strict_model.go
++++ b/internal/app/strict_model.go
+@@ -150,7 +150,8 @@ func strictLineCheck(mc ModelConfig, accountID func() int64) func(line string) e
+ var modelNameFoldRe = regexp.MustCompile(`[^a-z0-9.]+`)
+ 
+ func foldModelName(s string) string {
+-	return strings.TrimSpace(modelNameFoldRe.ReplaceAllString(strings.ToLower(s), " "))
++	folded := strings.TrimSpace(modelNameFoldRe.ReplaceAllString(strings.ToLower(s), " "))
++	return strings.TrimPrefix(folded, "gemini ")
+ }
+ 
+ // modelDowngraded 判断服务端自报的显示名是不是请求的那个模型。
+diff --git a/internal/app/tokenizer.go b/internal/app/tokenizer.go
+index 634f3b7..399057e 100644
+--- a/internal/app/tokenizer.go
++++ b/internal/app/tokenizer.go
+@@ -1,9 +1,17 @@
+ package app
+ 
+ import (
++	"crypto/sha1"
++	"encoding/base64"
+ 	"fmt"
++	"io"
++	"net/http"
+ 	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
+ 	"sync"
++	"time"
+ 
+ 	"github.com/pkoukk/tiktoken-go"
+ )
+@@ -13,16 +21,108 @@ import (
+ //
+ // 加载一次到内存（~5MB），后续 Encode 每次 ~微秒级。
+ var (
+-	tokenizer     *tiktoken.Tiktoken
+-	tokenizerOnce sync.Once
+-	tokenizerOK   bool
++	tokenizer            *tiktoken.Tiktoken
++	tokenizerOnce        sync.Once
++	tokenizerOK          bool
++	tokenizerHTTPTimeout = 2 * time.Second
+ )
+ 
++type boundedBpeLoader struct{}
++
++func tokenizerCacheDir() string {
++	if d := strings.TrimSpace(os.Getenv("TIKTOKEN_CACHE_DIR")); d != "" {
++		return d
++	}
++	if d := strings.TrimSpace(os.Getenv("DATA_GYM_CACHE_DIR")); d != "" {
++		return d
++	}
++	return filepath.Join(os.TempDir(), "data-gym-cache")
++}
++
++func parseTiktokenBpe(contents []byte) (map[string]int, error) {
++	bpeRanks := make(map[string]int)
++	for _, line := range strings.Split(string(contents), "\n") {
++		line = strings.TrimSpace(line)
++		if line == "" {
++			continue
++		}
++		parts := strings.Split(line, " ")
++		if len(parts) != 2 {
++			return nil, fmt.Errorf("invalid tiktoken bpe line")
++		}
++		token, err := base64.StdEncoding.DecodeString(parts[0])
++		if err != nil {
++			return nil, err
++		}
++		rank, err := strconv.Atoi(parts[1])
++		if err != nil {
++			return nil, err
++		}
++		bpeRanks[string(token)] = rank
++	}
++	if len(bpeRanks) == 0 {
++		return nil, fmt.Errorf("empty tiktoken bpe file")
++	}
++	return bpeRanks, nil
++}
++
++func (l *boundedBpeLoader) LoadTiktokenBpe(tiktokenBpeFile string) (map[string]int, error) {
++	if tiktokenBpeFile == "" {
++		return nil, fmt.Errorf("blobpath cannot be empty")
++	}
++	if !strings.HasPrefix(tiktokenBpeFile, "http://") && !strings.HasPrefix(tiktokenBpeFile, "https://") {
++		contents, err := os.ReadFile(tiktokenBpeFile)
++		if err != nil {
++			return nil, err
++		}
++		return parseTiktokenBpe(contents)
++	}
++
++	cacheDir := tokenizerCacheDir()
++	cacheKey := fmt.Sprintf("%x", sha1.Sum([]byte(tiktokenBpeFile)))
++	cachePath := filepath.Join(cacheDir, cacheKey)
++	if contents, err := os.ReadFile(cachePath); err == nil {
++		if ranks, err := parseTiktokenBpe(contents); err == nil {
++			return ranks, nil
++		}
++	}
++
++	client := &http.Client{Timeout: tokenizerHTTPTimeout}
++	resp, err := client.Get(tiktokenBpeFile)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("unexpected HTTP %d fetching tokenizer", resp.StatusCode)
++	}
++	contents, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, err
++	}
++	ranks, err := parseTiktokenBpe(contents)
++	if err != nil {
++		return nil, err
++	}
++
++	if err := os.MkdirAll(cacheDir, 0o755); err == nil {
++		tmp := fmt.Sprintf("%s.%d.tmp", cachePath, time.Now().UnixNano())
++		if err := os.WriteFile(tmp, contents, 0o644); err == nil {
++			if err := os.Rename(tmp, cachePath); err != nil {
++				_ = os.Remove(tmp)
++			}
++		}
++	}
++	return ranks, nil
++}
++
+ func initTokenizer() {
+ 	tokenizerOnce.Do(func() {
+ 		// tiktoken-go 第一次加载会从远端下 cl100k_base.tiktoken (~3MB)，
+ 		// 缓存到 ${TIKTOKEN_CACHE_DIR} 或 ${HOME}/.cache/tiktoken。
+-		// docker 镜像里建议预先 docker build 时缓存。
++		// 默认 loader 使用无超时的 http.DefaultClient，黑洞代理下会卡住启动；
++		// 这里改用带超时的 boundedBpeLoader，超时后立即回退到 chars/4。
++		tiktoken.SetBpeLoader(&boundedBpeLoader{})
+ 		t, err := tiktoken.GetEncoding("cl100k_base")
+ 		if err != nil {
+ 			fmt.Fprintf(os.Stderr, "[tokenizer] init failed (will fall back to chars/4): %v\n", err)
+diff --git a/internal/app/upload.go b/internal/app/upload.go
+index 7747a72..2753f93 100644
+--- a/internal/app/upload.go
++++ b/internal/app/upload.go
+@@ -2,6 +2,7 @@ package app
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+@@ -20,6 +21,11 @@ const uploadHost = "https://push.clients6.google.com/upload/"
+ // 匿名也能传成功，但传上去的文件在对话里引用会被回 1100，所以调用方要自己确保有 cookie。
+ // proxyURL 必须跟正式请求同一出口，否则在 Google 眼里是两个会话共用文件。
+ func uploadBytes(cookie, proxyURL string, data []byte, filename string) (string, error) {
++	return uploadBytesCtx(context.Background(), cookie, proxyURL, data, filename)
++}
++
++// uploadBytesCtx 同 uploadBytes，ctx 取消（客户端断开）时中止上传。
++func uploadBytesCtx(ctx context.Context, cookie, proxyURL string, data []byte, filename string) (string, error) {
+ 	pushID, pctx, err := getUploadTokens(cookie, proxyURL)
+ 	if err != nil {
+ 		return "", fmt.Errorf("取上传页面参数失败: %w", err)
+@@ -63,7 +69,7 @@ func uploadBytes(cookie, proxyURL string, data []byte, filename string) (string,
+ 		"X-Goog-Upload-Protocol":              "resumable",
+ 		"X-Goog-Upload-Header-Content-Length": strconv.Itoa(len(data)),
+ 	})
+-	status, respHead, body, err := uploadPost(uploadHost, startHeaders,
++	status, respHead, body, err := uploadPostCtx(ctx, uploadHost, startHeaders,
+ 		[]byte("File name: "+sanitizeUploadName(filename)), proxyURL)
+ 	if err != nil {
+ 		return "", fmt.Errorf("上传 start 失败: %w", err)
+@@ -82,7 +88,7 @@ func uploadBytes(cookie, proxyURL string, data []byte, filename string) (string,
+ 		"X-Goog-Upload-Command": "upload, finalize",
+ 		"X-Goog-Upload-Offset":  "0",
+ 	})
+-	status, _, body, err = uploadPost(putURL, upHeaders, data, proxyURL)
++	status, _, body, err = uploadPostCtx(ctx, putURL, upHeaders, data, proxyURL)
+ 	if err != nil {
+ 		return "", fmt.Errorf("上传 finalize 失败: %w", err)
+ 	}
+@@ -109,9 +115,14 @@ func sanitizeUploadName(name string) string {
+ 
+ // uploadPost 走跟主请求相同的出口发 POST，响应头一起带回（start 要取 x-goog-upload-url）。
+ func uploadPost(url string, headers map[string]string, body []byte, proxyURL string) (
++	int, map[string]string, []byte, error) {
++	return uploadPostCtx(context.Background(), url, headers, body, proxyURL)
++}
++
++func uploadPostCtx(ctx context.Context, url string, headers map[string]string, body []byte, proxyURL string) (
+ 	int, map[string]string, []byte, error) {
+ 	if proxyURL != "" {
+-		req, err := http.NewRequest("POST", url, bytes.NewReader(body))
++		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+ 		if err != nil {
+ 			return 0, nil, nil, err
+ 		}
+@@ -131,10 +142,11 @@ func uploadPost(url string, headers map[string]string, body []byte, proxyURL str
+ 		}
+ 		return resp.StatusCode, h, b, err
+ 	}
+-	req, err := fhttp.NewRequest("POST", url, bytes.NewReader(body))
++	req, err := fhttp.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+ 	if err != nil {
+ 		return 0, nil, nil, err
+ 	}
++	setChromeHeaders(req.Header)
+ 	for k, v := range headers {
+ 		req.Header.Set(k, v)
+ 	}
+diff --git a/internal/app/video_cooldown_test.go b/internal/app/video_cooldown_test.go
+index 8eda49e..cf64828 100644
+--- a/internal/app/video_cooldown_test.go
++++ b/internal/app/video_cooldown_test.go
+@@ -2,6 +2,7 @@ package app
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+@@ -24,7 +25,7 @@ func withVideoAccounts(t *testing.T, n int, call func(mc ModelConfig) (*StreamRe
+ 		ids = append(ids, id)
+ 	}
+ 	prevCall := videoCall
+-	videoCall = func(_, _ string, mc ModelConfig, _ []map[string]interface{}, _ []pendingUpload, _, _ func(string)) (string, []ToolCall, *StreamResult, error) {
++	videoCall = func(_ context.Context, _ string, _ promptCtx, mc ModelConfig, _ []map[string]interface{}, _ []pendingUpload, _, _ func(string)) (string, []ToolCall, *StreamResult, error) {
+ 		res, err := call(mc)
+ 		return "", nil, res, err
+ 	}
+diff --git a/internal/app/videos.go b/internal/app/videos.go
+index 4ea7ac6..861f72e 100644
+--- a/internal/app/videos.go
++++ b/internal/app/videos.go
+@@ -10,6 +10,7 @@ package app
+ // 只是把「阻塞等结果」挪到后台 goroutine，前台立即返 id。
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+@@ -233,7 +234,7 @@ func runVideoJobWith(j *videoJob, images []pendingUpload, pin int64, cont *ConvR
+ 		// An extension stays on the account and conversation of its parent; an exhausted
+ 		// account is still remembered so new videos skip it.
+ 		mc.PinAccountID = pin
+-		_, _, res, err = videoCall(j.Prompt, j.Prompt, mc, nil, images, nil, nil)
++		_, _, res, err = videoCall(context.Background(), j.Prompt, promptCtx{Latest: j.Prompt}, mc, nil, images, nil, nil)
+ 		if errors.Is(err, errVideoQuotaUsed) {
+ 			markVideoExhausted(pin, videoQuotaReset(err))
+ 		}
+@@ -283,7 +284,7 @@ func callOnVideoAccount(j *videoJob, mc ModelConfig, images []pendingUpload) (*S
+ 		}
+ 		skip[acct.ID] = true
+ 		mc.PinAccountID = acct.ID
+-		_, _, res, err = videoCall(j.Prompt, j.Prompt, mc, nil, images, nil, nil)
++		_, _, res, err = videoCall(context.Background(), j.Prompt, promptCtx{Latest: j.Prompt}, mc, nil, images, nil, nil)
+ 		if err == nil {
+ 			return res, nil
+ 		}
+diff --git a/internal/app/vision.go b/internal/app/vision.go
+index b0c9724..b1ca7cb 100644
+--- a/internal/app/vision.go
++++ b/internal/app/vision.go
+@@ -160,6 +160,7 @@ func fetchImage(src, proxyURL string, idx int) (pendingUpload, error) {
+ 		if err != nil {
+ 			return pendingUpload{}, err
+ 		}
++		setChromeHeaders(req.Header)
+ 		resp, err := getTLSClient().Do(req)
+ 		if err != nil {
+ 			return pendingUpload{}, fmt.Errorf("image %d: fetch failed: %w", idx, err)
+diff --git a/internal/app/xsrf.go b/internal/app/xsrf.go
+index c43b104..d3d7145 100644
+--- a/internal/app/xsrf.go
++++ b/internal/app/xsrf.go
+@@ -27,15 +27,23 @@ var (
+ )
+ 
+ type xsrfEntry struct {
+-	token   string
+-	pushID  string // 上传文件用的 Push-ID 头
+-	pctx    string // 上传文件用的 X-Client-Pctx 头
+-	fetched time.Time
++	token      string
++	pushID     string // 上传文件用的 Push-ID 头
++	pctx       string // 上传文件用的 X-Client-Pctx 头
++	fetched    time.Time
++	refreshing bool // 后台刷新正在飞，避免并发请求重复抓页面
+ }
+ 
+ // 页面上的 token 没写明有效期，取个保守值定期重取。
+ const xsrfTTL = 20 * time.Minute
+ 
++// xsrfRefreshAfter 之后命中缓存时照常返回，但在后台重抓一次页面。
++//
++// /app 页面约 770KB，抓一次 1-3 秒，不能放在请求的关键路径上；但同步重抓顺带
++// 起到「cookie 还活着吗」的探测作用（失效的号抓不到 SNlM0e）。后台刷新把这个探测
++// 挪出关键路径：刷新失败就丢掉缓存，下一个请求同步重取时照样报出失效、走换号逻辑。
++const xsrfRefreshAfter = 5 * time.Minute
++
+ var snlm0eRe = regexp.MustCompile(`"SNlM0e":"([^"]{10,200})"`)
+ 
+ // 上传要的两个页面参数，跟 XSRF token 同页取，省一次页面请求。
+@@ -44,8 +52,18 @@ var pushIDRe = regexp.MustCompile(`"qKIAYe":"([^"]{4,400})"`)
+ var pctxRe = regexp.MustCompile(`"Ylro7b":"([^"]{4,400})"`)
+ 
+ // cookieKey 用 cookie 的短摘要当缓存键，避免把整串凭证塞进 map key。
++//
++// 摘要只取账号身份（SAPISID + __Secure-1PSID，见 cookieIdentity），不取整串：
++// 上游几乎每个响应都刷新 *SIDCC，streamGenerate 合并 Set-Cookie 后写回账号，
++// 按整串取键的话下一个请求必然 miss，每次都要多抓一次 /app 页面（实测登录态每个
++// 请求多出约 0.9 秒，且不计入 ttfb_ms / total_ms）。token 跟会话绑定、不跟 SIDCC
++// 绑定；真过期了上游回 xsrf 错误，调用方 invalidate 后重取。
+ func cookieKey(cookie string) string {
+-	sum := sha1.Sum([]byte(cookie))
++	id := cookieIdentity(cookie)
++	if id == "|" { // 两项都没有：退回整串，至少不同 cookie 不会撞键
++		id = cookie
++	}
++	sum := sha1.Sum([]byte(id))
+ 	return hex.EncodeToString(sum[:8])
+ }
+ 
+@@ -67,12 +85,9 @@ func getXSRF(cookie, proxyURL string) (string, error) {
+ 	}
+ 	key := cookieKey(cookie)
+ 
+-	xsrfMu.Lock()
+-	if e, ok := xsrfCache[key]; ok && time.Since(e.fetched) < xsrfTTL {
+-		xsrfMu.Unlock()
++	if e, ok := cachedAppTokens(key, cookie, proxyURL); ok {
+ 		return e.token, nil
+ 	}
+-	xsrfMu.Unlock()
+ 
+ 	e, err := fetchAppTokens(cookie, proxyURL)
+ 	if err != nil {
+@@ -84,16 +99,48 @@ func getXSRF(cookie, proxyURL string) (string, error) {
+ 	return e.token, nil
+ }
+ 
++// cachedAppTokens 返回未过期的缓存项；过了 xsrfRefreshAfter 时顺带踢一次后台刷新。
++func cachedAppTokens(key, cookie, proxyURL string) (xsrfEntry, bool) {
++	xsrfMu.Lock()
++	defer xsrfMu.Unlock()
++	e, ok := xsrfCache[key]
++	if !ok || time.Since(e.fetched) >= xsrfTTL {
++		return xsrfEntry{}, false
++	}
++	if !e.refreshing && time.Since(e.fetched) >= xsrfRefreshAfter {
++		e.refreshing = true
++		xsrfCache[key] = e
++		go refreshAppTokens(key, cookie, proxyURL)
++	}
++	return e, true
++}
++
++// refreshAppTokens 后台重抓页面。失败就丢掉缓存，让下一个请求同步重取并报出失效。
++func refreshAppTokens(key, cookie, proxyURL string) {
++	if err := storeAppTokens(key, cookie, proxyURL); err != nil {
++		logf("[xsrf] 后台刷新失败，已作废缓存: %v", err)
++	}
++}
++
++func storeAppTokens(key, cookie, proxyURL string) error {
++	e, err := fetchAppTokens(cookie, proxyURL)
++	xsrfMu.Lock()
++	defer xsrfMu.Unlock()
++	if err != nil {
++		delete(xsrfCache, key)
++		return err
++	}
++	xsrfCache[key] = e
++	return nil
++}
++
+ // getUploadTokens 取上传要用的 Push-ID / X-Client-Pctx，跟 XSRF token 同一份缓存。
+ func getUploadTokens(cookie, proxyURL string) (pushID, pctx string, err error) {
+ 	key := cookieKey(cookie)
+ 
+-	xsrfMu.Lock()
+-	if e, ok := xsrfCache[key]; ok && time.Since(e.fetched) < xsrfTTL {
+-		xsrfMu.Unlock()
++	if e, ok := cachedAppTokens(key, cookie, proxyURL); ok {
+ 		return e.pushID, e.pctx, nil
+ 	}
+-	xsrfMu.Unlock()
+ 
+ 	e, err := fetchAppTokens(cookie, proxyURL)
+ 	if err != nil {
+@@ -146,6 +193,7 @@ func fetchAppPage(cookie, proxyURL string) ([]byte, error) {
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		setChromeHeaders(req.Header)
+ 		for k, v := range headers {
+ 			req.Header.Set(k, v)
+ 		}

@@ -1,0 +1,43 @@
+# Gemini-web-all
+
+把Gemini官网对话、官网原图生图、原有AI Studio接入和登录管理整合为一个Magpie供应商插件。基于 magpie-gemini-web 0.8.0；详见[致谢](NOTICE.md)。
+
+## 能力
+
+- Magpie Settings → Images → Image generation 中选择 `gemini-web/gemini-web-pro-image`（Gemini 官网生图 · Pro）。
+- 使用Magpie原有generate_image，支持参考图；生成后台运行，不开浏览器。
+- 原图必须经官网完整尺寸RPC下载，不回退预览图，不本地放大。已验证2752×1536；不承诺4K，quality不映射为官网质量档位。
+- 保留 `gemini-web` / `ai-studio` 供应商ID与原数据目录，已有登录无需重新复制Cookie。
+- 新增“自动获取 Cookie（独立登录窗口）”：用户完成Google登录后自动收取该独立窗口的登录态，关闭并清理临时浏览器目录。不会读取日常浏览器，也不会自动填写密码或绕过验证码。Google可能拒绝自动化浏览器；原Cookie导入入口保留作为回退。
+
+## 安装
+
+```sh
+magpie plugin add github:yumi233/Gemini-web-all
+```
+
+Magpie按package.json入口加载供应商；首次生图或自动登录时按需初始化Python运行环境（需安装uv）。后续可用 `magpie plugin update` 获取仓库更新。本项目未发布到npm或公共插件目录。
+
+### 本地安装
+
+本版实测macOS，要求Magpie、uv、Python3.12运行环境。运行 `sh install.sh`，安装固定Python依赖并通过 `magpie plugin add` 注册当前目录。只有新增账号时需要浏览器；优先复用本机Chrome或Playwright缓存，找不到时可安装 `playwright install chromium`。
+
+Runtime：`~/.local/share/gemini-web-all/venv`，可通过GEMINI_WEB_ALL_RUNTIME指定。官网对话账号数据库仍由原生后端维护于 `~/.local/share/magpie-gemini-web`；AI Studio数据目录沿用原插件。凭据不打包、不进入Git。
+
+原插件迁移：先安装并确认模型和账号工作，再停用旧magpie-gemini-web，保留账号目录。旧gemini-web-images MCP登记可移除。禁止先删除账号数据库或退出Google登录。
+
+## 限制
+
+- 模型名是官网Pro档位别名，不证明底层图片模型的具体版本。
+- 图片任务单并发；失败不自动跨账号重试。进程中断先核查官网历史，避免重复生成。
+- 官网协议可能变化；依赖固定版本，升级需再次验收。
+- 自动Cookie收取已测试隔离浏览器启动和合成Cookie读取；未替用户重新登录Google，真实登录的人机验证仍需用户操作。
+- 首版仅验证macOS，非跨平台承诺。
+
+## 鸣谢
+
+感谢BUKOWSKIREAL、HanaokaYuzu、zexadev、Mag1cFall及各项目贡献者，以及Magpie作者yetone。保留上游源码和许可证，见[NOTICE.md](NOTICE.md)。
+
+## 本机验收
+
+2026-10-31：在Magpie原生generate_image工具中，gemini-web/gemini-web-pro-image已出现，使用既有登录上传家具参考图生成成功；官网原图2752×1536，经Magpie保存。流式响应兼容已验证。Google自动登录端到端未重做，仅测试隔离浏览器启动与合成Cookie获取，避免要求现有用户重新登录。
