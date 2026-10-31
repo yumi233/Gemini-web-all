@@ -41,3 +41,9 @@ Runtime：`~/.local/share/gemini-web-all/venv`，可通过GEMINI_WEB_ALL_RUNTIME
 ## 本机验收
 
 2026-10-31：在Magpie原生generate_image工具中，gemini-web/gemini-web-pro-image已出现，使用既有登录上传家具参考图生成成功；官网原图2752×1536，经Magpie保存。流式响应兼容已验证。Google自动登录端到端未重做，仅测试隔离浏览器启动与合成Cookie获取，避免要求现有用户重新登录。
+
+## 登录状态说明
+
+若官网返回 UNAUTHENTICATED，插件会明确提示重新登录，不将访客模式的Flash Lite列表解释成订阅权限或Pro额度耗尽。账号卡片存在、数据库状态enabled并不能证明官网会话仍有效。
+
+仓库已设置 `magpie-plugin` GitHub主题，符合Magpie社区仓库发现条件；是否立即出现取决于GitHub索引与Magpie缓存，不代表官方精选或审核背书。

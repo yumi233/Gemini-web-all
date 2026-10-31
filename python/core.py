@@ -37,6 +37,8 @@ async def connect(account_id=None):
  for k,v in cookies.items():client.cookies.set(k,v,domain='.google.com',secure=True)
  try:
   await client.init(timeout=300,auto_refresh=False,verbose=False,watchdog_timeout=300)
+  if client.account_status.name == 'UNAUTHENTICATED':
+   raise ValueError('Gemini website session is not authenticated. Re-login in Gemini-web-all; existing account records are preserved. Flash Lite in this state is not proof of account entitlement.')
   if not client.list_models():raise ValueError('Authenticated models unavailable')
   return aid,client
  except BaseException:
