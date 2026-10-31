@@ -11,7 +11,9 @@
     "python",
     "vendor",
     "README.md",
-    "install.sh"
+    "install.sh",
+    "NOTICE.md",
+    "LICENSE"
   ],
   "license": "MIT",
   "engines": {
